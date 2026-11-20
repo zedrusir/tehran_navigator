@@ -1,13 +1,6 @@
 # =============================================================================
 # فایل جامع و خودکار (All-in-One) ساخت اپلیکیشن مسیریاب ۱۰۰٪ آفلاین کلانشهر تهران
 # بهینه‌سازی شده برای سخت‌افزار Samsung Galaxy A54 5G (معماری arm64-v8a)
-#
-# نحوه استفاده (بدون نیاز به ساخت دستی هیچ پوشه یا فایل دیگری):
-# 1. یک مخزن (Repository) خالی در GitHub بسازید.
-# 2. یک فایل جدید دقیقاً با مسیر زیر بسازید و کل محتوای همین فایل را داخلش بگذارید:
-#    .github/workflows/build_tehran_navigator_apk.yml
-# 3. وارد تب Actions مخزن شوید و دکمه Run workflow را بزنید.
-# 4. پس از اتمام ساخت، فایل TehranOfflineNavigator-GalaxyA54-APK را دانلود و نصب کنید.
 # =============================================================================
 
 name: Build Complete Tehran Offline Navigator APK
@@ -20,44 +13,394 @@ on:
       - master
 
 jobs:
-  build-complete-tehran-apk:
+  build-tehran-navigator:
     runs-on: ubuntu-latest
-    timeout-minutes: 50
+    timeout-minutes: 45
 
     steps:
-      - name: ۱. راه‌اندازی محیط Java 17 و ابزارهای پیش‌پردازش
+      - name: ۱. آماده‌سازی محیط و نصب Java 21 و ابزارهای پردازش نقشه
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y osmium-tool python3-pip curl wget unzip git
+          pip3 install --break-system-packages osmium shapely
+
+      - name: ۲. تنظیم Java 21 (سازگار با Planetiler، GraphHopper 10.0 و Gradle)
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
-          java-version: '17'
+          java-version: '21'
 
-      - name: راه‌اندازی Node.js برای تولید فونت‌های برداری فارسی (Glyphs)
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - name: نصب ابزارهای سیستمی و کتابخانه‌های پایتون
+      - name: ۳. دانلود نقشه خام تهران و اجرای ممیزی ایمنی
         run: |
-          sudo apt-get update
-          sudo apt-get install -y osmium-tool wget unzip imagemagick python3-pip sqlite3
-          pip3 install osmium shapely
+          mkdir -p data_pipeline
+          cd data_pipeline
+          wget -q https://download.geofabrik.de/asia/iran-latest.osm.pbf -O iran-latest.osm.pbf
+          osmium extract -b 51.05,35.50,51.68,35.86 iran-latest.osm.pbf -o tehran_raw.osm.pbf
+          osmium tags-filter tehran_raw.osm.pbf \
+            --remove-tags \
+            --invert-match \
+            nwr/landuse=military \
+            nwr/military \
+            n/highway=speed_camera \
+            n/enforcement \
+            -o tehran_clean.osm.pbf
+          rm -f iran-latest.osm.pbf tehran_raw.osm.pbf
+          ls -lh tehran_clean.osm.pbf
 
-      - name: ۲. تولید خودکار تمام پوشه‌ها و کدهای منبع پروژه اندروید (فاز ۱ تا ۵)
+      - name: ۴. تولید نقشه برداری فوق‌فشرده (tehran_vector.pmtiles)
         run: |
-          python3 - << 'PYBOOTSTRAP'
+          cd data_pipeline
+          wget -q https://github.com/onthegomap/planetiler/releases/download/v0.10.2/planetiler.jar -O planetiler.jar
+          java -Xmx4g -jar planetiler.jar \
+            --osm-path=tehran_clean.osm.pbf \
+            --output=tehran_vector.pmtiles \
+            --bounds=51.05,35.50,51.68,35.86 \
+            --languages=fa,en \
+            --download
+          ls -lh tehran_vector.pmtiles
+
+      - name: ۵. ساخت بانک اطلاعاتی جامع مکان‌ها و معابر تهران (SQLite FTS5 + R*Tree)
+        run: |
+          cat << 'EOF' > data_pipeline/build_tehran_places_db.py
+          import json
           import os
-          from pathlib import Path
+          import re
+          import sqlite3
+          import osmium
 
-          def write_file(rel_path: str, content: str):
-              p = Path(rel_path)
-              p.parent.mkdir(parents=True, exist_ok=True)
-              p.write_text(content.lstrip("\n"), encoding="utf-8")
-              print(f"[CREATED] {rel_path}")
+          ARABIC_TO_PERSIAN = str.maketrans({
+              "ي": "ی", "ى": "ی", "ك": "ک", "ة": "ه", "ؤ": "و",
+              "إ": "ا", "أ": "ا", "آ": "ا",
+              "٠": "0", "١": "1", "٢": "2", "٣": "3", "٤": "4",
+              "٥": "5", "٦": "6", "٧": "7", "٨": "8", "٩": "9",
+              "۰": "0", "۱": "1", "۲": "2", "۳": "3", "۴": "4",
+              "۵": "5", "۶": "6", "۷": "7", "۸": "8", "۹": "9",
+          })
+          DIACRITICS_REGEX = re.compile(r"[\u064B-\u065F\u0670\u0640]")
 
-          # -------------------------------------------------------------------
-          # الف) فایل‌های پایه Gradle و پیکربندی پروژه اندروید
-          # -------------------------------------------------------------------
-          write_file("settings.gradle.kts", r'''
+          def normalize_persian(text: str) -> str:
+              if not text:
+                  return ""
+              text = text.translate(ARABIC_TO_PERSIAN)
+              text = DIACRITICS_REGEX.sub("", text)
+              text = text.replace("\u200c", " ")
+              return re.sub(r"\s+", " ", text).strip().lower()
+
+          def classify_osm_tags(tags):
+              if "military" in tags or tags.get("landuse") == "military":
+                  return None
+              if tags.get("highway") == "speed_camera" or "enforcement" in tags:
+                  return None
+              if tags.get("access") in ("private", "no"):
+                  return None
+
+              amenity = tags.get("amenity", "")
+              shop = tags.get("shop", "")
+              railway = tags.get("railway", "")
+              highway = tags.get("highway", "")
+              leisure = tags.get("leisure", "")
+              tourism = tags.get("tourism", "")
+              place = tags.get("place", "")
+              public_transport = tags.get("public_transport", "")
+
+              if railway in ("station", "subway_entrance") or tags.get("station") == "subway":
+                  return ("metro", "ایستگاه مترو", 5)
+              if highway == "bus_stop" or public_transport in ("platform", "stop_position"):
+                  return ("bus_brt", "ایستگاه اتوبوس و BRT", 3)
+              if amenity == "fuel":
+                  return ("fuel", "جایگاه سوخت (بنزین / CNG)", 5)
+              if amenity == "parking":
+                  return ("parking", "پارکینگ عمومی و طبقاتی", 3)
+              if amenity == "hospital":
+                  return ("hospital", "بیمارستان", 5)
+              if amenity in ("clinic", "doctors"):
+                  return ("clinic", "درمانگاه و کلینیک", 4)
+              if amenity == "pharmacy":
+                  return ("pharmacy", "داروخانه", 4)
+              if amenity == "fire_station":
+                  return ("fire_station", "ایستگاه آتش‌نشانی", 4)
+              if amenity == "bank":
+                  return ("bank", "شعبه بانک", 3)
+              if amenity == "atm":
+                  return ("atm", "خودپرداز (ATM)", 2)
+              if amenity in ("university", "college"):
+                  return ("university", "دانشگاه و مرکز آموزش عالی", 5)
+              if amenity == "school":
+                  return ("school", "مدرسه و مرکز آموزشی", 3)
+              if leisure in ("park", "garden"):
+                  return ("park", "بوستان و فضای سبز", 4)
+              if shop in ("mall", "department_store", "supermarket"):
+                  return ("shopping", "مرکز خرید و فروشگاه", 4)
+              if amenity in ("restaurant", "fast_food", "cafe"):
+                  return ("food", "رستوران و کافه", 3)
+              if tourism in ("museum", "gallery", "attraction"):
+                  return ("tourism", "موزه و جاذبه گردشگری", 4)
+              if place in ("suburb", "quarter", "neighbourhood", "district"):
+                  return ("neighborhood", "محله و منطقه شهری", 5)
+              return None
+
+          class TehranOsmExtractor(osmium.SimpleHandler):
+              def __init__(self):
+                  super().__init__()
+                  self.places = []
+                  self.seen_streets = set()
+
+              def _get_persian_name(self, tags):
+                  return tags.get("name:fa") or tags.get("name") or tags.get("alt_name:fa")
+
+              def _build_address_hint(self, tags):
+                  parts = []
+                  district = tags.get("addr:district") or tags.get("is_in:suburb")
+                  street = tags.get("addr:street")
+                  if district:
+                      parts.append(f"محله {district}")
+                  if street:
+                      parts.append(f"خیابان {street}")
+                  return "، ".join(parts) if parts else "کلانشهر تهران"
+
+              def _process_element(self, tags, lat, lon, osm_id):
+                  if "military" in tags or tags.get("landuse") == "military" or tags.get("highway") == "speed_camera":
+                      return
+                  name = self._get_persian_name(tags)
+                  if not name:
+                      return
+
+                  highway = tags.get("highway")
+                  if highway in (
+                      "motorway", "trunk", "primary", "secondary", "tertiary",
+                      "residential", "unclassified", "living_street", "pedestrian"
+                  ):
+                      grid_key = (normalize_persian(name), round(lat, 2), round(lon, 2))
+                      if grid_key not in self.seen_streets:
+                          self.seen_streets.add(grid_key)
+                          road_type_fa = {
+                              "motorway": "بزرگراه",
+                              "trunk": "بزرگراه / شریان اصلی",
+                              "primary": "خیابان اصلی",
+                              "secondary": "خیابان فرعی",
+                              "tertiary": "خیابان محلی",
+                              "residential": "کوچه / معبر مسکونی",
+                          }.get(highway, "معبر شهری")
+                          prio = 4 if highway in ("motorway", "trunk", "primary") else 2
+                          self.places.append((
+                              osm_id, name, normalize_persian(name), "street", road_type_fa,
+                              self._build_address_hint(tags), "", "", lat, lon, prio
+                          ))
+                      return
+
+                  classified = classify_osm_tags(tags)
+                  if classified:
+                      cat_code, cat_fa, priority = classified
+                      self.places.append((
+                          osm_id, name, normalize_persian(name), cat_code, cat_fa,
+                          self._build_address_hint(tags),
+                          tags.get("phone") or tags.get("contact:phone", ""),
+                          tags.get("opening_hours", ""),
+                          lat, lon, priority
+                      ))
+
+              def node(self, n):
+                  if n.location.valid():
+                      self._process_element(dict(n.tags), n.location.lat, n.location.lon, n.id)
+
+              def way(self, w):
+                  tags = dict(w.tags)
+                  if not self._get_persian_name(tags):
+                      return
+                  coords = [(nd.lat, nd.lon) for nd in w.nodes if nd.location.valid()]
+                  if coords:
+                      mid_lat, mid_lon = coords[len(coords) // 2]
+                      self._process_element(tags, mid_lat, mid_lon, w.id)
+
+              def area(self, a):
+                  try:
+                      tags = dict(a.tags)
+                      if not self._get_persian_name(tags):
+                          return
+                      lats, lons = [], []
+                      for outer in a.outer_rings():
+                          for nd in outer:
+                              if nd.valid():
+                                  lats.append(nd.lat)
+                                  lons.append(nd.lon)
+                      if lats and lons:
+                          self._process_element(tags, sum(lats)/len(lats), sum(lons)/len(lons), a.id)
+                  except Exception:
+                      pass
+
+          TEHRAN_TRAFFIC_ZONES = [
+              {
+                  "zone_id": "main_traffic_zone",
+                  "title_fa": "محدوده طرح ترافیک اصلی تهران",
+                  "active_days": "شنبه تا چهارشنبه (۰۶:۳۰ تا ۱۸:۰۰)",
+                  "description": "محدوده مرکزی تهران",
+                  "polygon": [
+                      [51.3912, 35.7245], [51.4345, 35.7248], [51.4410, 35.6980],
+                      [51.4365, 35.6675], [51.3920, 35.6680], [51.3895, 35.7010],
+                      [51.3912, 35.7245]
+                  ]
+              },
+              {
+                  "zone_id": "air_pollution_zone",
+                  "title_fa": "محدوده کنترل آلودگی هوا (زوج و فرد سابق)",
+                  "active_days": "شنبه تا چهارشنبه (۰۶:۳۰ تا ۱۸:۰۰) و پنج‌شنبه‌ها (۰۶:۳۰ تا ۱۳:۰۰)",
+                  "description": "محدوده بزرگراه‌های همت، امام علی، بعثت و چمران/نواب",
+                  "polygon": [
+                      [51.3765, 35.7485], [51.4610, 35.7460], [51.4655, 35.6520],
+                      [51.3720, 35.6540], [51.3765, 35.7485]
+                  ]
+              }
+          ]
+
+          def main():
+              extractor = TehranOsmExtractor()
+              extractor.apply_file("data_pipeline/tehran_clean.osm.pbf", locations=True, idx="flex_mem")
+              print(f"Total Tehran places & streets extracted: {len(extractor.places)}")
+
+              db_path = "data_pipeline/tehran_places_fts5.db"
+              if os.path.exists(db_path):
+                  os.remove(db_path)
+
+              conn = sqlite3.connect(db_path)
+              cur = conn.cursor()
+              cur.executescript("""
+                  PRAGMA journal_mode = OFF;
+                  PRAGMA synchronous = OFF;
+                  PRAGMA page_size = 4096;
+                  CREATE TABLE android_metadata (locale TEXT);
+                  INSERT INTO android_metadata VALUES ('fa_IR');
+                  CREATE TABLE places (
+                      id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      osm_id INTEGER,
+                      name TEXT NOT NULL,
+                      name_normalized TEXT NOT NULL,
+                      category TEXT NOT NULL,
+                      category_fa TEXT NOT NULL,
+                      address_hint TEXT,
+                      phone TEXT,
+                      opening_hours TEXT,
+                      lat REAL NOT NULL,
+                      lon REAL NOT NULL,
+                      priority INTEGER DEFAULT 2
+                  );
+                  CREATE VIRTUAL TABLE places_fts USING fts5(
+                      name_normalized, category_fa, address_hint,
+                      content='places', content_rowid='id', tokenize='unicode61'
+                  );
+                  CREATE VIRTUAL TABLE places_rtree USING rtree(id, min_lat, max_lat, min_lon, max_lon);
+                  CREATE TABLE traffic_zones (
+                      zone_id TEXT PRIMARY KEY,
+                      title_fa TEXT NOT NULL,
+                      active_days TEXT NOT NULL,
+                      description TEXT,
+                      polygon_json TEXT NOT NULL
+                  );
+              """)
+
+              cur.executemany("""
+                  INSERT INTO places (
+                      osm_id, name, name_normalized, category, category_fa,
+                      address_hint, phone, opening_hours, lat, lon, priority
+                  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              """, extractor.places)
+
+              cur.executescript("""
+                  INSERT INTO places_fts (rowid, name_normalized, category_fa, address_hint)
+                  SELECT id, name_normalized, category_fa, address_hint FROM places;
+                  INSERT INTO places_rtree (id, min_lat, max_lat, min_lon, max_lon)
+                  SELECT id, lat, lat, lon, lon FROM places;
+                  CREATE INDEX idx_places_category ON places(category);
+                  CREATE INDEX idx_places_priority ON places(priority DESC);
+              """)
+
+              for z in TEHRAN_TRAFFIC_ZONES:
+                  cur.execute(
+                      "INSERT INTO traffic_zones VALUES (?, ?, ?, ?, ?)",
+                      (z["zone_id"], z["title_fa"], z["active_days"], z["description"], json.dumps(z["polygon"]))
+                  )
+
+              # تست خودکار جستجوی خیابان‌های اصلی تهران (ولیعصر و همت)
+              valiasr_count = cur.execute(
+                  "SELECT COUNT(*) FROM places_fts WHERE places_fts MATCH '\"ولیعصر\"*'"
+              ).fetchone()[0]
+              hemmat_count = cur.execute(
+                  "SELECT COUNT(*) FROM places_fts WHERE places_fts MATCH '\"همت\"*'"
+              ).fetchone()[0]
+              print(f"FTS5 Verification -> ولیعصر: {valiasr_count} matches | همت: {hemmat_count} matches")
+
+              conn.commit()
+              cur.execute("VACUUM;")
+              conn.close()
+
+          if __name__ == "__main__":
+              main()
+          EOF
+          python3 data_pipeline/build_tehran_places_db.py
+          ls -lh data_pipeline/tehran_places_fts5.db
+
+      - name: ۶. ساخت گراف مسیریابی آفلاین تهران با GraphHopper 10.0
+        run: |
+          cd data_pipeline
+          wget -q https://repo1.maven.org/maven2/com/graphhopper/graphhopper-web/10.0/graphhopper-web-10.0.jar -O graphhopper-web-10.0.jar
+          cat << 'EOF' > graphhopper_tehran_config.yml
+          graphhopper:
+            datareader.file: tehran_clean.osm.pbf
+            graph.location: tehran_routing_graph
+            graph.dataaccess: MMAP
+            graph.encoded_values: car_access, car_average_speed, foot_access, foot_average_speed, motorcycle_access, motorcycle_average_speed, max_speed, road_class, road_access, surface, toll
+            profiles:
+              - name: car
+                turn_costs:
+                  vehicle_types: [motorcar, motor_vehicle]
+                custom_model_files: [car.json]
+              - name: motorcycle
+                turn_costs:
+                  vehicle_types: [motorcycle, motor_vehicle]
+                custom_model_files: [motorcycle.json]
+              - name: foot
+                custom_model_files: [foot.json]
+            profiles_ch:
+              - profile: car
+              - profile: motorcycle
+              - profile: foot
+            profiles_lm:
+              - profile: car
+              - profile: motorcycle
+            prepare.min_network_size: 200
+            routing.non_ch.max_waypoint_distance: 1000000
+          server:
+            application_connectors:
+              - type: http
+                port: 8989
+                bind_host: localhost
+          EOF
+          java -Xmx4g -jar graphhopper-web-10.0.jar import graphhopper_tehran_config.yml
+          ls -lh tehran_routing_graph
+
+      - name: ۷. دریافت فونت‌های برداری فارسی (Glyphs) و آیکون‌های آفلاین (Sprites)
+        run: |
+          git clone --depth 1 https://github.com/protomaps/basemaps-assets.git data_pipeline/basemaps-assets
+          mkdir -p "app/src/main/assets/map/glyphs/Noto Sans Medium"
+          cp -r "data_pipeline/basemaps-assets/fonts/Noto Sans Medium/"*.pbf "app/src/main/assets/map/glyphs/Noto Sans Medium/"
+          mkdir -p app/src/main/assets/map/sprites
+          cp data_pipeline/basemaps-assets/sprites/v4/dark.json app/src/main/assets/map/sprites/sprite.json
+          cp data_pipeline/basemaps-assets/sprites/v4/dark.png app/src/main/assets/map/sprites/sprite.png
+          cp data_pipeline/basemaps-assets/sprites/v4/dark@2x.json app/src/main/assets/map/sprites/sprite@2x.json
+          cp data_pipeline/basemaps-assets/sprites/v4/dark@2x.png app/src/main/assets/map/sprites/sprite@2x.png
+
+      - name: ۸. تولید کامل کدهای پروژه اندروید و ادغام داده‌های آفلاین تهران
+        run: |
+          python3 << 'EOF'
+          import os
+          import shutil
+
+          def write_file(path, content):
+              os.makedirs(os.path.dirname(path), exist_ok=True)
+              with open(path, "w", encoding="utf-8") as f:
+                  f.write(content.lstrip("\n"))
+
+          # 1. Gradle Root & Settings
+          write_file("settings.gradle.kts", '''
           pluginManagement {
               repositories {
                   google()
@@ -76,7 +419,7 @@ jobs:
           include(":app")
           ''')
 
-          write_file("build.gradle.kts", r'''
+          write_file("build.gradle.kts", '''
           plugins {
               id("com.android.application") version "8.7.2" apply false
               id("org.jetbrains.kotlin.android") version "2.0.21" apply false
@@ -84,13 +427,15 @@ jobs:
           }
           ''')
 
-          write_file("gradle.properties", r'''
+          write_file("gradle.properties", '''
           org.gradle.jvmargs=-Xmx4096m -Dfile.encoding=UTF-8
           android.useAndroidX=true
           kotlin.code.style=official
+          android.nonTransitiveRClass=true
           ''')
 
-          write_file("app/build.gradle.kts", r'''
+          # 2. App build.gradle.kts (GraphHopper 10.0 + MapLibre + Compose + Release Signing)
+          write_file("app/build.gradle.kts", '''
           plugins {
               id("com.android.application")
               id("org.jetbrains.kotlin.android")
@@ -113,21 +458,35 @@ jobs:
                   }
               }
 
+              signingConfigs {
+                  create("release") {
+                      storeFile = file("tehran_release.keystore")
+                      storePassword = "tehran_offline_key"
+                      keyAlias = "tehran_nav"
+                      keyPassword = "tehran_offline_key"
+                  }
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                      signingConfig = signingConfigs.getByName("release")
+                  }
+              }
+
               androidResources {
                   noCompress += listOf("pmtiles", "db", "pbf", "bin")
               }
 
               packaging {
                   resources {
-                      excludes += listOf(
+                      excludes += setOf(
                           "META-INF/DEPENDENCIES",
                           "META-INF/LICENSE",
                           "META-INF/LICENSE.txt",
-                          "META-INF/license.txt",
                           "META-INF/NOTICE",
                           "META-INF/NOTICE.txt",
-                          "META-INF/notice.txt",
-                          "META-INF/*.kotlin_module"
+                          "META-INF/INDEX.LIST"
                       )
                   }
               }
@@ -137,7 +496,6 @@ jobs:
               }
 
               compileOptions {
-                  isCoreLibraryDesugaringEnabled = true
                   sourceCompatibility = JavaVersion.VERSION_17
                   targetCompatibility = JavaVersion.VERSION_17
               }
@@ -148,8 +506,6 @@ jobs:
           }
 
           dependencies {
-              coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.3")
-
               val composeBom = platform("androidx.compose:compose-bom:2024.10.00")
               implementation(composeBom)
               implementation("androidx.compose.ui:ui")
@@ -159,10 +515,8 @@ jobs:
               implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.7")
               implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
 
-              // موتور رندر برداری سخت‌افزاری MapLibre Native
               implementation("org.maplibre.gl:android-sdk:11.8.0")
 
-              // موتور مسیریابی آفلاین GraphHopper Core نسخه مدرن 10.0
               implementation("com.graphhopper:graphhopper-core:10.0") {
                   exclude(group = "com.google.protobuf", module = "protobuf-java")
                   exclude(group = "org.openstreetmap.osmosis", module = "osmosis-osm-binary")
@@ -170,22 +524,20 @@ jobs:
               }
               implementation("org.slf4j:slf4j-android:1.7.36")
 
-              // کوروتین‌ها و ذخیره محلی تنظیمات
               implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
               implementation("androidx.datastore:datastore-preferences:1.1.1")
           }
           ''')
 
-          # -------------------------------------------------------------------
-          # ب) مانیفست و منابع گرافیکی اپلیکیشن اندروید
-          # -------------------------------------------------------------------
-          write_file("app/src/main/AndroidManifest.xml", r'''
+          # 3. AndroidManifest.xml & Resources
+          write_file("app/src/main/AndroidManifest.xml", '''
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
               <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
               <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
-              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
               <uses-permission android:name="android.permission.WAKE_LOCK" />
 
               <uses-feature android:name="android.hardware.location.gps" android:required="true" />
@@ -195,8 +547,7 @@ jobs:
                   android:allowBackup="false"
                   android:hardwareAccelerated="true"
                   android:icon="@mipmap/ic_launcher"
-                  android:roundIcon="@mipmap/ic_launcher_round"
-                  android:label="@string/app_name"
+                  android:label="مسیریاب آفلاین تهران"
                   android:largeHeap="true"
                   android:supportsRtl="true"
                   android:theme="@android:style/Theme.Material.NoActionBar">
@@ -216,19 +567,15 @@ jobs:
           </manifest>
           ''')
 
-          write_file("app/src/main/res/values/strings.xml", r'''
-          <resources>
-              <string name="app_name">مسیریاب آفلاین تهران</string>
-          </resources>
-          ''')
-
-          write_file("app/src/main/res/values/colors.xml", r'''
+          write_file("app/src/main/res/values/colors.xml", '''
+          <?xml version="1.0" encoding="utf-8"?>
           <resources>
               <color name="ic_launcher_background">#064E3B</color>
           </resources>
           ''')
 
-          write_file("app/src/main/res/drawable/ic_launcher_foreground.xml", r'''
+          write_file("app/src/main/res/drawable/ic_launcher_foreground.xml", '''
+          <?xml version="1.0" encoding="utf-8"?>
           <vector xmlns:android="http://schemas.android.com/apk/res/android"
               android:width="108dp"
               android:height="108dp"
@@ -236,11 +583,11 @@ jobs:
               android:viewportHeight="108">
               <path
                   android:fillColor="#10B981"
-                  android:pathData="M54,24 L74,78 L54,67 L34,78 Z" />
+                  android:pathData="M54,24L74,80L54,68L34,80Z" />
           </vector>
           ''')
 
-          write_file("app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml", r'''
+          write_file("app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml", '''
           <?xml version="1.0" encoding="utf-8"?>
           <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
               <background android:drawable="@color/ic_launcher_background" />
@@ -248,18 +595,8 @@ jobs:
           </adaptive-icon>
           ''')
 
-          write_file("app/src/main/res/mipmap-anydpi-v26/ic_launcher_round.xml", r'''
-          <?xml version="1.0" encoding="utf-8"?>
-          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
-              <background android:drawable="@color/ic_launcher_background" />
-              <foreground android:drawable="@drawable/ic_launcher_foreground" />
-          </adaptive-icon>
-          ''')
-
-          # -------------------------------------------------------------------
-          # ج) استایل‌های برداری روز و شب ویژه نمایشگر Super AMOLED Galaxy A54
-          # -------------------------------------------------------------------
-          write_file("app/src/main/assets/map/style_night_amoled.json", r'''
+          # 4. MapLibre Day & Night AMOLED Styles (Using Offline Noto Sans Medium Glyphs)
+          write_file("app/src/main/assets/map/style_night_amoled.json", '''
           {
             "version": 8,
             "name": "Tehran Night Super AMOLED",
@@ -285,13 +622,6 @@ jobs:
                 "source-layer": "landuse",
                 "filter": ["in", "class", "park", "garden", "forest", "grass"],
                 "paint": { "fill-color": "#062117", "fill-opacity": 0.9 }
-              },
-              {
-                "id": "tehran-waterways",
-                "type": "line",
-                "source": "tehran_vector",
-                "source-layer": "waterway",
-                "paint": { "line-color": "#0c2d48", "line-width": 2.5 }
               },
               {
                 "id": "tehran-buildings-3d",
@@ -373,7 +703,7 @@ jobs:
                 "minzoom": 12,
                 "layout": {
                   "text-field": ["coalesce", ["get", "name:fa"], ["get", "name"]],
-                  "text-font": ["Vazirmatn Bold"],
+                  "text-font": ["Noto Sans Medium"],
                   "text-size": 12,
                   "symbol-placement": "line",
                   "text-rotation-alignment": "map"
@@ -393,7 +723,7 @@ jobs:
                 "maxzoom": 15.5,
                 "layout": {
                   "text-field": ["coalesce", ["get", "name:fa"], ["get", "name"]],
-                  "text-font": ["Vazirmatn Bold"],
+                  "text-font": ["Noto Sans Medium"],
                   "text-size": ["interpolate", ["linear"], ["zoom"], 10, 11, 14, 15]
                 },
                 "paint": {
@@ -406,7 +736,7 @@ jobs:
           }
           ''')
 
-          write_file("app/src/main/assets/map/style_day_amoled.json", r'''
+          write_file("app/src/main/assets/map/style_day_amoled.json", '''
           {
             "version": 8,
             "name": "Tehran High-Contrast Daylight",
@@ -504,7 +834,7 @@ jobs:
                 "minzoom": 12,
                 "layout": {
                   "text-field": ["coalesce", ["get", "name:fa"], ["get", "name"]],
-                  "text-font": ["Vazirmatn Bold"],
+                  "text-font": ["Noto Sans Medium"],
                   "text-size": 12,
                   "symbol-placement": "line"
                 },
@@ -523,7 +853,7 @@ jobs:
                 "maxzoom": 15.5,
                 "layout": {
                   "text-field": ["coalesce", ["get", "name:fa"], ["get", "name"]],
-                  "text-font": ["Vazirmatn Bold"],
+                  "text-font": ["Noto Sans Medium"],
                   "text-size": 14
                 },
                 "paint": {
@@ -536,359 +866,10 @@ jobs:
           }
           ''')
 
-          # -------------------------------------------------------------------
-          # د) فایل‌های کارخانه داده تهران (GraphHopper 10.0 Config + SQLite FTS5 Builder)
-          # -------------------------------------------------------------------
-          write_file("data_pipeline/graphhopper_tehran_config.yml", r'''
-          graphhopper:
-            datareader.file: tehran_clean.osm.pbf
-            graph.location: tehran_routing_graph
-            graph.dataaccess.default_type: MMAP
-            graph.encoded_values: car_access, car_average_speed, foot_access, foot_average_speed, motorcycle_access, motorcycle_average_speed, max_speed, road_class, road_access, surface, toll
+          # 5. Kotlin Source Files
+          pkg = "app/src/main/java/ir/tehran/navigator"
 
-            profiles:
-              - name: car
-                custom_model_files: [car.json]
-                turn_costs:
-                  vehicle_types: [motorcar, motor_vehicle]
-              - name: motorcycle
-                custom_model_files: [motorcycle.json]
-                turn_costs:
-                  vehicle_types: [motorcycle, motor_vehicle]
-              - name: foot
-                custom_model_files: [foot.json]
-
-            profiles_ch:
-              - profile: car
-              - profile: motorcycle
-              - profile: foot
-
-            profiles_lm:
-              - profile: car
-              - profile: motorcycle
-
-            prepare.min_network_size: 200
-            routing.non_ch.max_waypoint_distance: 1000000
-
-          server:
-            application_connectors:
-              - type: http
-                port: 8989
-                bind_host: localhost
-          ''')
-
-          write_file("data_pipeline/build_tehran_places_db.py", r'''
-          #!/usr/bin/env python3
-          # -*- coding: utf-8 -*-
-          import argparse
-          import json
-          import os
-          import re
-          import sqlite3
-          import sys
-          from typing import Dict, List, Optional, Tuple
-          import osmium
-
-          ARABIC_TO_PERSIAN = str.maketrans({
-              "ي": "ی", "ى": "ی", "ك": "ک", "ة": "ه", "ؤ": "و",
-              "إ": "ا", "أ": "ا", "آ": "ا",
-              "٠": "0", "١": "1", "٢": "2", "٣": "3", "٤": "4",
-              "٥": "5", "٦": "6", "٧": "7", "٨": "8", "٩": "9",
-              "۰": "0", "۱": "1", "۲": "2", "۳": "3", "۴": "4",
-              "۵": "5", "۶": "6", "۷": "7", "۸": "8", "۹": "9",
-          })
-          DIACRITICS_REGEX = re.compile(r"[\u064B-\u065F\u0670\u0640]")
-
-          def normalize_persian(text: str) -> str:
-              if not text:
-                  return ""
-              text = text.translate(ARABIC_TO_PERSIAN)
-              text = DIACRITICS_REGEX.sub("", text)
-              text = text.replace("\u200c", " ")
-              return re.sub(r"\s+", " ", text).strip().lower()
-
-          def classify_osm_tags(tags: Dict[str, str]) -> Optional[Tuple[str, str, int]]:
-              if "military" in tags or tags.get("landuse") == "military":
-                  return None
-              if tags.get("highway") == "speed_camera" or "enforcement" in tags:
-                  return None
-              if tags.get("access") in ("private", "no"):
-                  return None
-
-              amenity = tags.get("amenity", "")
-              shop = tags.get("shop", "")
-              railway = tags.get("railway", "")
-              highway = tags.get("highway", "")
-              leisure = tags.get("leisure", "")
-              tourism = tags.get("tourism", "")
-              place = tags.get("place", "")
-              public_transport = tags.get("public_transport", "")
-
-              if railway in ("station", "subway_entrance") or tags.get("station") == "subway":
-                  return ("metro", "ایستگاه مترو", 5)
-              if highway == "bus_stop" or public_transport in ("platform", "stop_position"):
-                  return ("bus_brt", "ایستگاه اتوبوس و BRT", 3)
-              if amenity == "fuel":
-                  return ("fuel", "جایگاه سوخت (بنزین / CNG)", 5)
-              if amenity == "charging_station":
-                  return ("ev_charge", "ایستگاه شارژ خودرو برقی", 4)
-              if amenity == "parking":
-                  return ("parking", "پارکینگ عمومی و طبقاتی", 3)
-              if amenity == "taxi":
-                  return ("taxi", "ایستگاه تاکسی", 2)
-              if amenity == "hospital":
-                  return ("hospital", "بیمارستان", 5)
-              if amenity in ("clinic", "doctors"):
-                  return ("clinic", "درمانگاه و کلینیک", 4)
-              if amenity == "pharmacy":
-                  return ("pharmacy", "داروخانه شبانه‌روزی" if tags.get("opening_hours") == "24/7" else "داروخانه", 4)
-              if amenity == "fire_station":
-                  return ("fire_station", "ایستگاه آتش‌نشانی", 4)
-              if amenity == "bank":
-                  return ("bank", "شعبه بانک", 3)
-              if amenity == "atm":
-                  return ("atm", "خودپرداز (ATM)", 2)
-              if amenity == "post_office":
-                  return ("post", "اداره پست و پیشخوان", 3)
-              if amenity in ("townhall", "public_building") or "office" in tags:
-                  return ("office", "اداره و مرکز خدماتی", 3)
-              if amenity in ("university", "college"):
-                  return ("university", "دانشگاه و مرکز آموزش عالی", 5)
-              if amenity == "school":
-                  return ("school", "مدرسه و مرکز آموزشی", 3)
-              if amenity == "library":
-                  return ("library", "کتابخانه", 3)
-              if tourism in ("museum", "gallery", "attraction"):
-                  return ("tourism", "موزه و جاذبه گردشگری", 4)
-              if amenity in ("cinema", "theatre"):
-                  return ("cinema", "سینما و فرهنگسرا", 4)
-              if leisure in ("park", "garden"):
-                  return ("park", "بوستان و فضای سبز", 4)
-              if leisure in ("sports_centre", "stadium", "swimming_pool"):
-                  return ("sport", "مجموعه ورزشی", 3)
-              if shop in ("mall", "department_store", "supermarket"):
-                  return ("shopping", "مرکز خرید و فروشگاه بزرگ", 4)
-              if shop == "bakery":
-                  return ("bakery", "نانوایی", 2)
-              if amenity in ("restaurant", "fast_food", "cafe"):
-                  return ("food", "رستوران و کافه", 3)
-              if place in ("suburb", "quarter", "neighbourhood", "district"):
-                  return ("neighborhood", "محله و منطقه شهری", 5)
-              return None
-
-          class TehranOsmExtractor(osmium.SimpleHandler):
-              def __init__(self):
-                  super().__init__()
-                  self.places: List[Tuple] = []
-                  self.seen_streets = set()
-                  self.streets_count = 0
-
-              def _get_persian_name(self, tags) -> Optional[str]:
-                  return tags.get("name:fa") or tags.get("name") or tags.get("alt_name:fa")
-
-              def _build_address_hint(self, tags) -> str:
-                  parts = []
-                  district = tags.get("addr:district") or tags.get("is_in:suburb")
-                  street = tags.get("addr:street")
-                  housenumber = tags.get("addr:housenumber")
-                  maxspeed = tags.get("maxspeed")
-                  if district:
-                      parts.append(f"محله {district}")
-                  if street:
-                      parts.append(f"خیابان {street}")
-                  if housenumber:
-                      parts.append(f"پلاک {housenumber}")
-                  if maxspeed and maxspeed.isdigit():
-                      parts.append(f"سرعت مجاز {maxspeed} km/h")
-                  return "، ".join(parts) if parts else "کلانشهر تهران"
-
-              def _process_element(self, tags, lat: float, lon: float, osm_id: int):
-                  if "military" in tags or tags.get("landuse") == "military" or tags.get("highway") == "speed_camera":
-                      return
-                  name = self._get_persian_name(tags)
-                  if not name:
-                      return
-
-                  highway = tags.get("highway")
-                  if highway in (
-                      "motorway", "trunk", "primary", "secondary", "tertiary",
-                      "residential", "unclassified", "living_street", "pedestrian", "service"
-                  ):
-                      # تقسیم‌بندی شبکه جغرافیایی ~1.5 کیلومتر تا خیابان‌های طولانی (مثل ولیعصر) در چند نقطه کلیدی ثبت شوند
-                      grid_key = (normalize_persian(name), round(lat, 2), round(lon, 2))
-                      if grid_key not in self.seen_streets:
-                          self.seen_streets.add(grid_key)
-                          self.streets_count += 1
-                          road_type_fa = {
-                              "motorway": "بزرگراه",
-                              "trunk": "بزرگراه / شریان اصلی",
-                              "primary": "خیابان اصلی",
-                              "secondary": "خیابان فرعی",
-                              "tertiary": "خیابان محلی",
-                              "residential": "کوچه / معبر مسکونی",
-                              "living_street": "کوچه مسکونی",
-                              "pedestrian": "پیاده‌راه",
-                              "service": "معبر دسترسی",
-                          }.get(highway, "معبر شهری")
-
-                          priority = 4 if highway in ("motorway", "trunk", "primary") else 3
-                          self.places.append((
-                              osm_id, name, normalize_persian(name), "street", road_type_fa,
-                              self._build_address_hint(tags), tags.get("phone", ""),
-                              tags.get("opening_hours", ""), lat, lon, priority
-                          ))
-                      return
-
-                  classified = classify_osm_tags(tags)
-                  if classified:
-                      cat_code, cat_fa, priority = classified
-                      self.places.append((
-                          osm_id, name, normalize_persian(name), cat_code, cat_fa,
-                          self._build_address_hint(tags),
-                          tags.get("phone") or tags.get("contact:phone", ""),
-                          tags.get("opening_hours", ""), lat, lon, priority
-                      ))
-
-              def node(self, n):
-                  if n.location.valid():
-                      self._process_element(dict(n.tags), n.location.lat, n.location.lon, n.id)
-
-              def way(self, w):
-                  # استخراج تمام خیابان‌ها، بزرگراه‌ها، بلوارها و کوچه‌های خطی تهران
-                  tags = dict(w.tags)
-                  if not self._get_persian_name(tags):
-                      return
-                  valid_coords = [(n.lat, n.lon) for n in w.nodes if n.location.valid()]
-                  if not valid_coords:
-                      return
-                  # انتخاب نقطه میانی روی خط معبر
-                  mid_lat, mid_lon = valid_coords[len(valid_coords) // 2]
-                  self._process_element(tags, mid_lat, mid_lon, w.id)
-
-              def area(self, a):
-                  try:
-                      tags = dict(a.tags)
-                      if not self._get_persian_name(tags):
-                          return
-                      lats, lons = [], []
-                      for outer in a.outer_rings():
-                          for node in outer:
-                              if node.valid():
-                                  lats.append(node.lat)
-                                  lons.append(node.lon)
-                      if lats and lons:
-                          self._process_element(tags, sum(lats)/len(lats), sum(lons)/len(lons), a.id)
-                  except Exception:
-                      pass
-
-          TEHRAN_TRAFFIC_ZONES = [
-              {
-                  "zone_id": "main_traffic_zone",
-                  "title_fa": "محدوده طرح ترافیک اصلی تهران",
-                  "active_days": "شنبه تا چهارشنبه (۰۶:۳۰ تا ۱۸:۰۰)",
-                  "description": "محدوده مرکزی تهران",
-                  "polygon": [
-                      [51.3912, 35.7245], [51.4345, 35.7248], [51.4410, 35.6980],
-                      [51.4365, 35.6675], [51.3920, 35.6680], [51.3895, 35.7010],
-                      [51.3912, 35.7245]
-                  ]
-              },
-              {
-                  "zone_id": "air_pollution_zone",
-                  "title_fa": "محدوده کنترل آلودگی هوا (زوج و فرد سابق)",
-                  "active_days": "شنبه تا چهارشنبه (۰۶:۳۰ تا ۱۸:۰۰) و پنج‌شنبه‌ها (۰۶:۳۰ تا ۱۳:۰۰)",
-                  "description": "محدوده بزرگراه‌های همت، امام علی، بعثت و چمران/نواب",
-                  "polygon": [
-                      [51.3765, 35.7485], [51.4610, 35.7460], [51.4655, 35.6520],
-                      [51.3720, 35.6540], [51.3765, 35.7485]
-                  ]
-              }
-          ]
-
-          def build_sqlite_database(places: List[Tuple], db_path: str):
-              if os.path.exists(db_path):
-                  os.remove(db_path)
-              conn = sqlite3.connect(db_path)
-              cur = conn.cursor()
-              cur.executescript("""
-                  PRAGMA journal_mode = OFF;
-                  PRAGMA synchronous = OFF;
-                  PRAGMA page_size = 4096;
-                  CREATE TABLE android_metadata (locale TEXT);
-                  INSERT INTO android_metadata VALUES ('fa_IR');
-                  CREATE TABLE db_info (key TEXT PRIMARY KEY, value TEXT);
-                  CREATE TABLE places (
-                      id INTEGER PRIMARY KEY AUTOINCREMENT,
-                      osm_id INTEGER,
-                      name TEXT NOT NULL,
-                      name_normalized TEXT NOT NULL,
-                      category TEXT NOT NULL,
-                      category_fa TEXT NOT NULL,
-                      address_hint TEXT,
-                      phone TEXT,
-                      opening_hours TEXT,
-                      lat REAL NOT NULL,
-                      lon REAL NOT NULL,
-                      priority INTEGER DEFAULT 2
-                  );
-                  CREATE VIRTUAL TABLE places_fts USING fts5(
-                      name_normalized, category_fa, address_hint,
-                      content='places', content_rowid='id', tokenize='unicode61'
-                  );
-                  CREATE VIRTUAL TABLE places_rtree USING rtree(
-                      id, min_lat, max_lat, min_lon, max_lon
-                  );
-                  CREATE TABLE traffic_zones (
-                      zone_id TEXT PRIMARY KEY,
-                      title_fa TEXT NOT NULL,
-                      active_days TEXT NOT NULL,
-                      description TEXT,
-                      polygon_json TEXT NOT NULL
-                  );
-              """)
-              cur.executemany("""
-                  INSERT INTO places (
-                      osm_id, name, name_normalized, category, category_fa,
-                      address_hint, phone, opening_hours, lat, lon, priority
-                  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-              """, places)
-              cur.executescript("""
-                  INSERT INTO places_fts (rowid, name_normalized, category_fa, address_hint)
-                  SELECT id, name_normalized, category_fa, address_hint FROM places;
-                  INSERT INTO places_rtree (id, min_lat, max_lat, min_lon, max_lon)
-                  SELECT id, lat, lat, lon, lon FROM places;
-                  CREATE INDEX idx_places_category ON places(category);
-                  CREATE INDEX idx_places_priority ON places(priority DESC);
-              """)
-              for z in TEHRAN_TRAFFIC_ZONES:
-                  cur.execute("""
-                      INSERT INTO traffic_zones (zone_id, title_fa, active_days, description, polygon_json)
-                      VALUES (?, ?, ?, ?, ?)
-                  """, (z["zone_id"], z["title_fa"], z["active_days"], z["description"], json.dumps(z["polygon"])))
-              cur.execute("INSERT INTO db_info VALUES ('city', 'Tehran');")
-              cur.execute("INSERT INTO db_info VALUES ('total_records', ?);", (str(len(places)),))
-              conn.commit()
-              cur.execute("VACUUM;")
-              conn.close()
-
-          def main():
-              parser = argparse.ArgumentParser()
-              parser.add_argument("--pbf", required=True)
-              parser.add_argument("--out", default="tehran_places_fts5.db")
-              args = parser.parse_args()
-              extractor = TehranOsmExtractor()
-              extractor.apply_file(args.pbf, locations=True, idx="flex_mem")
-              print(f"Extracted {len(extractor.places):,} Tehran places & {extractor.streets_count:,} street segments.")
-              build_sqlite_database(extractor.places, args.out)
-
-          if __name__ == "__main__":
-              main()
-          ''')
-
-          # -------------------------------------------------------------------
-          # هـ) تمام فایل‌های سورس کاتلین اپلیکیشن اندروید (فازهای ۲ تا ۵)
-          # -------------------------------------------------------------------
-          write_file("app/src/main/java/ir/tehran/navigator/data/storage/TehranOfflineStorageManager.kt", r'''
+          write_file(f"{pkg}/data/storage/TehranOfflineStorageManager.kt", '''
           package ir.tehran.navigator.data.storage
 
           import android.content.Context
@@ -920,7 +901,6 @@ jobs:
                   private const val MAP_SUBDIR = "map"
                   private const val ROUTING_SUBDIR = "routing/tehran_routing_graph"
                   private const val DB_SUBDIR = "database"
-
                   const val PMTILES_FILENAME = "tehran_vector.pmtiles"
                   const val PLACES_DB_FILENAME = "tehran_places_fts5.db"
               }
@@ -968,7 +948,7 @@ jobs:
 
                       val targetDbFile = File(packageDir, "$DB_SUBDIR/$PLACES_DB_FILENAME")
                       if (!targetDbFile.exists()) {
-                          onProgress(55, "در حال آماده‌سازی بانک جامع معابر و مکان‌های تهران...")
+                          onProgress(55, "در حال آماده‌سازی بانک مکان‌ها و معابر تهران...")
                           copyAssetFile("database/$PLACES_DB_FILENAME", targetDbFile)
                       }
 
@@ -1074,7 +1054,7 @@ jobs:
           }
           ''')
 
-          write_file("app/src/main/java/ir/tehran/navigator/ui/map/TehranMapComposable.kt", r'''
+          write_file(f"{pkg}/ui/map/TehranMapComposable.kt", '''
           package ir.tehran.navigator.ui.map
 
           import android.net.Uri
@@ -1116,7 +1096,9 @@ jobs:
               val lifecycleOwner = LocalLifecycleOwner.current
               val storageManager = remember { TehranOfflineStorageManager(context) }
 
-              remember { MapLibre.getInstance(context) }
+              remember {
+                  MapLibre.getInstance(context)
+              }
 
               val tehranBounds = remember {
                   LatLngBounds.Builder()
@@ -1177,7 +1159,8 @@ jobs:
               LaunchedEffect(mapLibreInstance, is3DTiltEnabled) {
                   val map = mapLibreInstance ?: return@LaunchedEffect
                   val targetTilt = if (is3DTiltEnabled) 45.0 else 0.0
-                  val updatedPos = CameraPosition.Builder(map.cameraPosition)
+                  val currentPos = map.cameraPosition
+                  val updatedPos = CameraPosition.Builder(currentPos)
                       .tilt(targetTilt)
                       .build()
                   map.animateCamera(CameraUpdateFactory.newCameraPosition(updatedPos), 450)
@@ -1195,6 +1178,7 @@ jobs:
                       }
                   }
                   lifecycleOwner.lifecycle.addObserver(observer)
+
                   onDispose {
                       lifecycleOwner.lifecycle.removeObserver(observer)
                       mapView.onDestroy()
@@ -1208,7 +1192,7 @@ jobs:
           }
           ''')
 
-          write_file("app/src/main/java/ir/tehran/navigator/ui/map/RouteOverlayMapExtension.kt", r'''
+          write_file(f"{pkg}/ui/map/RouteOverlayMapExtension.kt", '''
           package ir.tehran.navigator.ui.map
 
           import android.graphics.Color
@@ -1377,7 +1361,7 @@ jobs:
           }
           ''')
 
-          write_file("app/src/main/java/ir/tehran/navigator/domain/calendar/PersianCalendarEngine.kt", r'''
+          write_file(f"{pkg}/domain/calendar/PersianCalendarEngine.kt", '''
           package ir.tehran.navigator.domain.calendar
 
           import java.util.Calendar
@@ -1455,7 +1439,6 @@ jobs:
                   extraHolidays: Set<Triple<Int, Int, Int>> = emptySet()
               ): TehranTrafficPolicyStatus {
                   val jDate = getTehranJalaliDate(timestampMillis)
-
                   val fixedHolidayName = FIXED_SHAMSI_HOLIDAYS[jDate.month to jDate.day]
                   val isCustomHoliday = extraHolidays.contains(Triple(jDate.year, jDate.month, jDate.day))
                   val isHoliday = jDate.dayOfWeek.isWeekend || fixedHolidayName != null || isCustomHoliday
@@ -1534,7 +1517,7 @@ jobs:
           }
           ''')
 
-          write_file("app/src/main/java/ir/tehran/navigator/data/routing/TehranTrafficZoneManager.kt", r'''
+          write_file(f"{pkg}/data/routing/TehranTrafficZoneManager.kt", '''
           package ir.tehran.navigator.data.routing
 
           import android.database.sqlite.SQLiteDatabase
@@ -1623,21 +1606,40 @@ jobs:
 
                       val intersect = ((yi > lat) != (yj > lat)) &&
                               (lon < (xj - xi) * (lat - yi) / ((yj - yi) + 1e-12) + xi)
-                      if (intersect) inside = !inside
+                      if (intersect) {
+                          inside = !inside
+                      }
                       j = i
                   }
                   return inside
               }
 
-              fun buildGraphHopperBlockAreaString(zoneIdsToAvoid: List<String>): String? {
-                  val areaStrings = mutableListOf<String>()
+              fun buildGraphHopperCustomModelAvoidJson(zoneIdsToAvoid: List<String>): String? {
+                  val features = mutableListOf<String>()
+                  val priorityRules = mutableListOf<String>()
+
                   for (id in zoneIdsToAvoid) {
                       val zone = cachedZones[id] ?: continue
                       val shrunken = shrinkPolygonSlightly(zone.vertices, factor = 0.96)
-                      val coordsJoined = shrunken.joinToString(",") { "${it.lat},${it.lon}" }
-                      areaStrings.add(coordsJoined)
+                      val ringCoords = shrunken.joinToString(",") { "[${it.lon}, ${it.lat}]" }
+                      features.add(
+                          """{"id": "$id", "type": "Feature", "properties": {}, "geometry": {"type": "Polygon", "coordinates": [[$ringCoords]]}}"""
+                      )
+                      priorityRules.add(
+                          """{"if": "in_$id", "multiply_by": "0"}"""
+                      )
                   }
-                  return if (areaStrings.isEmpty()) null else areaStrings.joinToString(";")
+
+                  if (features.isEmpty()) return null
+                  return """
+                  {
+                    "areas": {
+                      "type": "FeatureCollection",
+                      "features": [${features.joinToString(",")}]
+                    },
+                    "priority": [${priorityRules.joinToString(",")}]
+                  }
+                  """.trimIndent()
               }
 
               private fun shrinkPolygonSlightly(vertices: List<GeoCoord>, factor: Double): List<GeoCoord> {
@@ -1666,7 +1668,7 @@ jobs:
           }
           ''')
 
-          write_file("app/src/main/java/ir/tehran/navigator/data/routing/TehranOfflineRoutingEngine.kt", r'''
+          write_file(f"{pkg}/data/routing/TehranOfflineRoutingEngine.kt", '''
           package ir.tehran.navigator.data.routing
 
           import com.graphhopper.GHRequest
@@ -1676,9 +1678,11 @@ jobs:
           import com.graphhopper.config.CHProfile
           import com.graphhopper.config.LMProfile
           import com.graphhopper.config.Profile
+          import com.graphhopper.jackson.Jackson
+          import com.graphhopper.storage.DAType
+          import com.graphhopper.util.CustomModel
           import com.graphhopper.util.GHUtility
           import com.graphhopper.util.Parameters
-          import com.graphhopper.util.Translation
           import com.graphhopper.util.TurnCostsConfig
           import com.graphhopper.util.shapes.GHPoint
           import ir.tehran.navigator.domain.calendar.PersianCalendarEngine
@@ -1758,23 +1762,20 @@ jobs:
 
                           return@withLock try {
                               val hopper = GraphHopper().forMobile()
-                              hopper.setMemoryMapped()
-                              hopper.setEncodedValuesString(
-                                  "car_access, car_average_speed, foot_access, foot_average_speed, " +
-                                  "motorcycle_access, motorcycle_average_speed, max_speed, road_class, " +
-                                  "road_access, surface, toll"
+                              hopper.setDataAccessType(DAType.MMAP)
+                              hopper.encodedValuesString =
+                                  "car_access, car_average_speed, foot_access, foot_average_speed, motorcycle_access, motorcycle_average_speed, max_speed, road_class, road_access, surface, toll"
+
+                              hopper.profiles = listOf(
+                                  Profile("car")
+                                      .setTurnCostsConfig(TurnCostsConfig(listOf("motorcar", "motor_vehicle")))
+                                      .setCustomModel(GHUtility.loadCustomModelFromJar("car.json")),
+                                  Profile("motorcycle")
+                                      .setTurnCostsConfig(TurnCostsConfig(listOf("motorcycle", "motor_vehicle")))
+                                      .setCustomModel(GHUtility.loadCustomModelFromJar("motorcycle.json")),
+                                  Profile("foot")
+                                      .setCustomModel(GHUtility.loadCustomModelFromJar("foot.json"))
                               )
-
-                              val carProfile = Profile("car")
-                                  .setCustomModel(GHUtility.loadCustomModelFromJar("car.json"))
-                                  .setTurnCostsConfig(TurnCostsConfig.car())
-                              val motoProfile = Profile("motorcycle")
-                                  .setCustomModel(GHUtility.loadCustomModelFromJar("motorcycle.json"))
-                                  .setTurnCostsConfig(TurnCostsConfig(listOf("motorcycle", "motor_vehicle")))
-                              val footProfile = Profile("foot")
-                                  .setCustomModel(GHUtility.loadCustomModelFromJar("foot.json"))
-
-                              hopper.profiles = listOf(carProfile, motoProfile, footProfile)
 
                               hopper.chPreparationHandler.setCHProfiles(
                                   CHProfile("car"),
@@ -1826,11 +1827,10 @@ jobs:
                       }
                   }
 
-                  val persianLocale = Locale("fa")
                   val ghPoints = waypoints.map { GHPoint(it.first, it.second) }
                   val request = GHRequest(ghPoints)
                       .setProfile(prefs.mode.profileName)
-                      .setLocale(persianLocale)
+                      .setLocale(Locale("fa"))
 
                   request.hints.putObject(Parameters.Routing.INSTRUCTIONS, true)
                   request.hints.putObject(Parameters.Routing.CALC_POINTS, true)
@@ -1838,9 +1838,10 @@ jobs:
                   var requiresDynamicLm = false
 
                   if (zonesToAvoid.isNotEmpty() && warningMessage == null) {
-                      val blockAreaStr = trafficZoneManager.buildGraphHopperBlockAreaString(zonesToAvoid)
-                      if (!blockAreaStr.isNullOrBlank()) {
-                          request.hints.putObject(Parameters.Routing.BLOCK_AREA, blockAreaStr)
+                      val customModelJson = trafficZoneManager.buildGraphHopperCustomModelAvoidJson(zonesToAvoid)
+                      if (!customModelJson.isNullOrBlank()) {
+                          val customModel = Jackson.newObjectMapper().readValue(customModelJson, CustomModel::class.java)
+                          request.customModel = customModel
                           requiresDynamicLm = true
                       }
                   }
@@ -1863,13 +1864,10 @@ jobs:
                           return@withContext RoutingResult.Error("خطا در محاسبه مسیر در محدوده تهران: $errDetail")
                       }
 
-                      val translation: Translation = hopper.translationMap.getWithFallBack(persianLocale)
-
                       val parsedRoutes = response.all.mapIndexed { index, path ->
                           mapResponsePathToDomain(
                               index = index,
                               path = path,
-                              translation = translation,
                               hasTrafficAvoidance = zonesToAvoid.isNotEmpty() && warningMessage == null,
                               warningMessage = warningMessage
                           )
@@ -1892,6 +1890,7 @@ jobs:
               ): List<String> {
                   if (prefs.mode == TransportMode.PEDESTRIAN) return emptyList()
                   val avoidList = mutableListOf<String>()
+
                   if (policy.isMainTrafficZoneActive && !prefs.hasMainTrafficPermit) {
                       avoidList.add("main_traffic_zone")
                   }
@@ -1907,14 +1906,13 @@ jobs:
               private fun mapResponsePathToDomain(
                   index: Int,
                   path: ResponsePath,
-                  translation: Translation,
                   hasTrafficAvoidance: Boolean,
                   warningMessage: String?
               ): CalculatedRoute {
                   val label = when {
                       index == 0 && hasTrafficAvoidance -> "سریع‌ترین مسیر (بدون طرح ترافیک)"
                       index == 0 -> "سریع‌ترین مسیر پیشنهادی"
-                      else -> "مسیر جایگزین $index"
+                      else -> "مسیر جایگزین ${index}"
                   }
 
                   val pointList = path.points
@@ -1928,7 +1926,7 @@ jobs:
                       val firstPointLon = if (inst.points.size() > 0) inst.points.getLon(0) else 0.0
 
                       ManeuverStep(
-                          instructionTextFa = inst.getTurnDescription(translation),
+                          instructionTextFa = inst.getTurnDescription(inst.tr),
                           streetName = inst.name.ifBlank { "معبر بدون نام" },
                           distanceMeters = inst.distance,
                           durationMillis = inst.time,
@@ -1959,7 +1957,7 @@ jobs:
           }
           ''')
 
-          write_file("app/src/main/java/ir/tehran/navigator/domain/search/PersianTextNormalizer.kt", r'''
+          write_file(f"{pkg}/domain/search/PersianTextNormalizer.kt", '''
           package ir.tehran.navigator.domain.search
 
           import kotlin.math.atan2
@@ -1977,7 +1975,6 @@ jobs:
 
               fun normalize(input: String): String {
                   if (input.isBlank()) return ""
-
                   val sb = StringBuilder(input.length)
                   for (ch in input) {
                       val mapped = when (ch) {
@@ -2013,18 +2010,10 @@ jobs:
                   val cleaned = normalize(rawQuery).replace(FTS5_SPECIAL_CHARS_REGEX, " ")
                   val tokens = cleaned.split(" ").filter { it.isNotBlank() }
                   if (tokens.isEmpty()) return ""
-
-                  return tokens.joinToString(" AND ") { token ->
-                      "\"$token\"*"
-                  }
+                  return tokens.joinToString(" AND ") { token -> "\"$token\"*" }
               }
 
-              fun haversineDistanceMeters(
-                  lat1: Double,
-                  lon1: Double,
-                  lat2: Double,
-                  lon2: Double
-              ): Double {
+              fun haversineDistanceMeters(lat1: Double, lon1: Double, lat2: Double, lon2: Double): Double {
                   val earthRadiusMeters = 6371000.0
                   val dLat = Math.toRadians(lat2 - lat1)
                   val dLon = Math.toRadians(lon2 - lon1)
@@ -2039,12 +2028,9 @@ jobs:
               }
 
               fun distancePointToSegmentMeters(
-                  pLat: Double,
-                  pLon: Double,
-                  aLat: Double,
-                  aLon: Double,
-                  bLat: Double,
-                  bLon: Double
+                  pLat: Double, pLon: Double,
+                  aLat: Double, aLon: Double,
+                  bLat: Double, bLon: Double
               ): Double {
                   val metersPerDegLat = 110950.0
                   val metersPerDegLon = 111320.0 * cos(Math.toRadians(35.72))
@@ -2055,22 +2041,17 @@ jobs:
                   val by = (bLat - aLat) * metersPerDegLat
 
                   val segLenSq = bx * bx + by * by
-                  if (segLenSq < 1e-6) {
-                      return sqrt(px * px + py * py)
-                  }
+                  if (segLenSq < 1e-6) return sqrt(px * px + py * py)
 
                   val t = max(0.0, min(1.0, (px * bx + py * by) / segLenSq))
-                  val projX = t * bx
-                  val projY = t * by
-
-                  val dx = px - projX
-                  val dy = py - projY
+                  val dx = px - (t * bx)
+                  val dy = py - (t * by)
                   return sqrt(dx * dx + dy * dy)
               }
           }
           ''')
 
-          write_file("app/src/main/java/ir/tehran/navigator/data/database/TehranOfflinePlacesRepository.kt", r'''
+          write_file(f"{pkg}/data/database/TehranOfflinePlacesRepository.kt", '''
           package ir.tehran.navigator.data.database
 
           import android.database.Cursor
@@ -2194,7 +2175,6 @@ jobs:
                   limit: Int = 30
               ): List<TehranPlace> = withContext(Dispatchers.IO) {
                   val db = database ?: return@withContext emptyList()
-
                   val latDelta = radiusMeters / 110950.0
                   val lonDelta = radiusMeters / (111320.0 * cos(Math.toRadians(centerLat)))
 
@@ -2306,7 +2286,6 @@ jobs:
                       db.rawQuery(sql, args).use { cursor ->
                           while (cursor.moveToNext()) {
                               val rawPlace = mapCursorToPlace(cursor, null, null)
-
                               var minSegDist = Double.MAX_VALUE
                               for (i in 0 until sampledRoute.size - 1) {
                                   val (aLat, aLon) = sampledRoute[i]
@@ -2316,7 +2295,6 @@ jobs:
                                   )
                                   if (d < minSegDist) minSegDist = d
                               }
-
                               if (minSegDist <= maxDetourMeters) {
                                   matchedAlongRoute.add(rawPlace.copy(distanceMeters = minSegDist))
                               }
@@ -2332,13 +2310,7 @@ jobs:
               }
 
               suspend fun reverseGeocodeOffline(lat: Double, lon: Double): String = withContext(Dispatchers.IO) {
-                  val nearby = searchNearby(
-                      centerLat = lat,
-                      centerLon = lon,
-                      radiusMeters = 250.0,
-                      categoryFilter = null,
-                      limit = 3
-                  )
+                  val nearby = searchNearby(lat, lon, radiusMeters = 250.0, categoryFilter = null, limit = 3)
                   if (nearby.isEmpty()) {
                       return@withContext "محدوده شهری تهران (%.4f, %.4f)".format(lat, lon)
                   }
@@ -2351,11 +2323,7 @@ jobs:
                   return@withContext "نزدیک ${closest.name}$hint"
               }
 
-              private fun mapCursorToPlace(
-                  cursor: Cursor,
-                  refLat: Double?,
-                  refLon: Double?
-              ): TehranPlace {
+              private fun mapCursorToPlace(cursor: Cursor, refLat: Double?, refLon: Double?): TehranPlace {
                   val lat = cursor.getDouble(8)
                   val lon = cursor.getDouble(9)
                   val dist = if (refLat != null && refLon != null) {
@@ -2391,7 +2359,7 @@ jobs:
           }
           ''')
 
-          write_file("app/src/main/java/ir/tehran/navigator/data/location/TehranGnssAndTunnelFusionEngine.kt", r'''
+          write_file(f"{pkg}/data/location/TehranGnssAndTunnelFusionEngine.kt", '''
           package ir.tehran.navigator.data.location
 
           import android.annotation.SuppressLint
@@ -2470,7 +2438,6 @@ jobs:
                   override fun onSatelliteStatusChanged(status: GnssStatus) {
                       var usedCount = 0
                       val constellations = mutableSetOf<String>()
-
                       for (i in 0 until status.satelliteCount) {
                           if (status.usedInFix(i)) {
                               usedCount++
@@ -2561,7 +2528,6 @@ jobs:
                   }
 
                   val speedKmh = if (location.hasSpeed()) location.speed * 3.6f else 0f
-
                   val (snappedLat, snappedLon) = snapToActiveRouteIfClose(
                       location.latitude,
                       location.longitude,
@@ -2606,7 +2572,6 @@ jobs:
                   val elapsedSinceLastFixSec = (now - lastValidGnssTimeMillis) / 1000.0
 
                   if (elapsedSinceLastFixSec < 2.5 || elapsedSinceLastFixSec > 180.0) return
-
                   val entrySpeedMps = if (lastLoc.hasSpeed()) lastLoc.speed else 0f
                   if (entrySpeedMps < 4.0f) return
 
@@ -2616,9 +2581,7 @@ jobs:
                       max(0.45, 1.0 - ((elapsedSinceLastFixSec - 45.0) * 0.008))
                   }
 
-                  val dtStepSec = 0.5
-                  val distanceStepMeters = entrySpeedMps * dampingFactor * dtStepSec
-
+                  val distanceStepMeters = entrySpeedMps * dampingFactor * 0.5
                   val bearingRad = Math.toRadians(currentHeadingDegrees.toDouble())
                   val dLat = (distanceStepMeters * cos(bearingRad)) / 110950.0
                   val dLon = (distanceStepMeters * sin(bearingRad)) / (111320.0 * cos(Math.toRadians(currentDeadReckoningLat)))
@@ -2708,7 +2671,7 @@ jobs:
           }
           ''')
 
-          write_file("app/src/main/java/ir/tehran/navigator/data/audio/TehranPersianVoiceGuidanceEngine.kt", r'''
+          write_file(f"{pkg}/data/audio/TehranPersianVoiceGuidanceEngine.kt", '''
           package ir.tehran.navigator.data.audio
 
           import android.content.Context
@@ -2754,14 +2717,11 @@ jobs:
               override fun onInit(status: Int) {
                   if (status == TextToSpeech.SUCCESS) {
                       val engine = tts ?: return
-                      val irLocale = Locale("fa", "IR")
-                      val genericFaLocale = Locale("fa")
-
-                      val resultIr = engine.setLanguage(irLocale)
+                      val resultIr = engine.setLanguage(Locale("fa", "IR"))
                       if (resultIr != TextToSpeech.LANG_MISSING_DATA && resultIr != TextToSpeech.LANG_NOT_SUPPORTED) {
                           isPersianVoiceAvailable = true
                       } else {
-                          val resultFa = engine.setLanguage(genericFaLocale)
+                          val resultFa = engine.setLanguage(Locale("fa"))
                           isPersianVoiceAvailable =
                               (resultFa != TextToSpeech.LANG_MISSING_DATA && resultFa != TextToSpeech.LANG_NOT_SUPPORTED)
                       }
@@ -2804,9 +2764,7 @@ jobs:
 
                   val dedupKey = "${stepIndex}_$stageTag"
                   val now = System.currentTimeMillis()
-                  if (dedupKey == lastSpokenKey && (now - lastSpokenTimeMillis) < 12_000L) {
-                      return
-                  }
+                  if (dedupKey == lastSpokenKey && (now - lastSpokenTimeMillis) < 12_000L) return
                   lastSpokenKey = dedupKey
                   lastSpokenTimeMillis = now
 
@@ -2845,8 +2803,7 @@ jobs:
               private fun speakText(text: String) {
                   if (!isTtsReady) return
                   requestTransientAudioFocus()
-                  val utteranceId = "TEHRAN_NAV_${System.currentTimeMillis()}"
-                  tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, utteranceId)
+                  tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "TEHRAN_NAV_${System.currentTimeMillis()}")
               }
 
               private fun playAlertTone(isImmediate: Boolean) {
@@ -2871,13 +2828,6 @@ jobs:
                               .build()
                           audioFocusRequest = req
                           audioManager.requestAudioFocus(req)
-                      } else {
-                          @Suppress("DEPRECATION")
-                          audioManager.requestAudioFocus(
-                              null,
-                              AudioManager.STREAM_MUSIC,
-                              AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK
-                          )
                       }
                   } catch (e: Exception) {
                       e.printStackTrace()
@@ -2904,7 +2854,7 @@ jobs:
           }
           ''')
 
-          write_file("app/src/main/java/ir/tehran/navigator/data/preferences/TehranNavigationPreferencesStore.kt", r'''
+          write_file(f"{pkg}/data/preferences/TehranNavigationPreferencesStore.kt", '''
           package ir.tehran.navigator.data.preferences
 
           import android.content.Context
@@ -2984,90 +2934,63 @@ jobs:
                   fun isCurrentlyNightInTehran(timestampMillis: Long = System.currentTimeMillis()): Boolean {
                       val tehranTz = TimeZone.getTimeZone("Asia/Tehran")
                       val cal = Calendar.getInstance(tehranTz).apply { timeInMillis = timestampMillis }
-
                       val dayOfYear = cal.get(Calendar.DAY_OF_YEAR)
                       val currentHourDecimal = cal.get(Calendar.HOUR_OF_DAY) + (cal.get(Calendar.MINUTE) / 60.0)
 
                       val latRad = Math.toRadians(35.7219)
                       val lonDeg = 51.3890
-
                       val declination = Math.toRadians(23.44) * sin(Math.toRadians((360.0 / 365.0) * (dayOfYear - 81)))
                       val zenith = Math.toRadians(90.833)
-
-                      val cosHourAngle = (cos(zenith) - sin(latRad) * sin(declination)) / (cos(latRad) * cos(declination))
-                      val clampedCos = cosHourAngle.coerceIn(-1.0, 1.0)
-                      val hourAngleDeg = Math.toDegrees(acos(clampedCos))
+                      val cosHourAngle = ((cos(zenith) - sin(latRad) * sin(declination)) / (cos(latRad) * cos(declination))).coerceIn(-1.0, 1.0)
+                      val hourAngleDeg = Math.toDegrees(acos(cosHourAngle))
 
                       val b = Math.toRadians((360.0 / 365.0) * (dayOfYear - 81))
                       val eotMinutes = 9.87 * sin(2 * b) - 7.53 * cos(b) - 1.5 * sin(b)
-
-                      val standardMeridian = 52.5
-                      val timeOffsetMinutes = 4.0 * (standardMeridian - lonDeg) - eotMinutes
+                      val timeOffsetMinutes = 4.0 * (52.5 - lonDeg) - eotMinutes
                       val solarNoonLocal = 12.0 + (timeOffsetMinutes / 60.0)
 
                       val sunriseLocal = solarNoonLocal - (hourAngleDeg / 15.0)
                       val sunsetLocal = solarNoonLocal + (hourAngleDeg / 15.0)
-
                       return currentHourDecimal < (sunriseLocal - 0.15) || currentHourDecimal > (sunsetLocal + 0.25)
                   }
               }
 
               val settingsFlow: Flow<NavigatorUserSettings> = context.tehranNavDataStore.data.map { prefs ->
                   NavigatorUserSettings(
-                      transportMode = prefs[KEY_TRANSPORT_MODE]?.let {
-                          runCatching { TransportMode.valueOf(it) }.getOrNull()
-                      } ?: TransportMode.CAR,
+                      transportMode = prefs[KEY_TRANSPORT_MODE]?.let { runCatching { TransportMode.valueOf(it) }.getOrNull() } ?: TransportMode.CAR,
                       hasMainTrafficPermit = prefs[KEY_MAIN_TRAFFIC_PERMIT] ?: false,
                       hasAirPollutionPermit = prefs[KEY_POLLUTION_PERMIT] ?: true,
                       motorcyclesExemptFromPollution = prefs[KEY_MOTO_EXEMPT] ?: true,
                       computeAlternativeRoutes = prefs[KEY_ALT_ROUTES] ?: true,
                       rerouteThresholdMeters = prefs[KEY_REROUTE_THRESHOLD] ?: 40f,
-                      voiceGuidanceLevel = prefs[KEY_VOICE_LEVEL]?.let {
-                          runCatching { VoiceGuidanceLevel.valueOf(it) }.getOrNull()
-                      } ?: VoiceGuidanceLevel.FULL,
+                      voiceGuidanceLevel = prefs[KEY_VOICE_LEVEL]?.let { runCatching { VoiceGuidanceLevel.valueOf(it) }.getOrNull() } ?: VoiceGuidanceLevel.FULL,
                       voiceSpeechRate = prefs[KEY_VOICE_RATE] ?: 1.05f,
-                      themePreference = prefs[KEY_THEME_PREF]?.let {
-                          runCatching { AppThemePreference.valueOf(it) }.getOrNull()
-                      } ?: AppThemePreference.AUTO_TEHRAN_SUN,
+                      themePreference = prefs[KEY_THEME_PREF]?.let { runCatching { AppThemePreference.valueOf(it) }.getOrNull() } ?: AppThemePreference.AUTO_TEHRAN_SUN,
                       is3DBuildingsEnabled = prefs[KEY_3D_BUILDINGS] ?: true,
                       showTrafficZonesOverlay = prefs[KEY_SHOW_ZONES] ?: true,
                       keepScreenOnDuringNavigation = prefs[KEY_KEEP_SCREEN_ON] ?: true,
-                      performanceMode = prefs[KEY_PERF_MODE]?.let {
-                          runCatching { HardwarePerformanceMode.valueOf(it) }.getOrNull()
-                      } ?: HardwarePerformanceMode.BALANCED_ADAPTIVE,
-                      storageLocation = prefs[KEY_STORAGE_LOC]?.let {
-                          runCatching { StorageLocation.valueOf(it) }.getOrNull()
-                      } ?: StorageLocation.INTERNAL_UFS
+                      performanceMode = prefs[KEY_PERF_MODE]?.let { runCatching { HardwarePerformanceMode.valueOf(it) }.getOrNull() } ?: HardwarePerformanceMode.BALANCED_ADAPTIVE,
+                      storageLocation = prefs[KEY_STORAGE_LOC]?.let { runCatching { StorageLocation.valueOf(it) }.getOrNull() } ?: StorageLocation.INTERNAL_UFS
                   )
               }
 
               suspend fun updateSettings(transform: (NavigatorUserSettings) -> NavigatorUserSettings) {
                   context.tehranNavDataStore.edit { prefs ->
                       val current = NavigatorUserSettings(
-                          transportMode = prefs[KEY_TRANSPORT_MODE]?.let {
-                              runCatching { TransportMode.valueOf(it) }.getOrNull()
-                          } ?: TransportMode.CAR,
+                          transportMode = prefs[KEY_TRANSPORT_MODE]?.let { runCatching { TransportMode.valueOf(it) }.getOrNull() } ?: TransportMode.CAR,
                           hasMainTrafficPermit = prefs[KEY_MAIN_TRAFFIC_PERMIT] ?: false,
                           hasAirPollutionPermit = prefs[KEY_POLLUTION_PERMIT] ?: true,
                           motorcyclesExemptFromPollution = prefs[KEY_MOTO_EXEMPT] ?: true,
                           computeAlternativeRoutes = prefs[KEY_ALT_ROUTES] ?: true,
                           rerouteThresholdMeters = prefs[KEY_REROUTE_THRESHOLD] ?: 40f,
-                          voiceGuidanceLevel = prefs[KEY_VOICE_LEVEL]?.let {
-                              runCatching { VoiceGuidanceLevel.valueOf(it) }.getOrNull()
-                          } ?: VoiceGuidanceLevel.FULL,
+                          voiceGuidanceLevel = prefs[KEY_VOICE_LEVEL]?.let { runCatching { VoiceGuidanceLevel.valueOf(it) }.getOrNull() } ?: VoiceGuidanceLevel.FULL,
                           voiceSpeechRate = prefs[KEY_VOICE_RATE] ?: 1.05f,
-                          themePreference = prefs[KEY_THEME_PREF]?.let {
-                              runCatching { AppThemePreference.valueOf(it) }.getOrNull()
-                          } ?: AppThemePreference.AUTO_TEHRAN_SUN,
+                          themePreference = prefs[KEY_THEME_PREF]?.let { runCatching { AppThemePreference.valueOf(it) }.getOrNull() } ?: AppThemePreference.AUTO_TEHRAN_SUN,
                           is3DBuildingsEnabled = prefs[KEY_3D_BUILDINGS] ?: true,
                           showTrafficZonesOverlay = prefs[KEY_SHOW_ZONES] ?: true,
                           keepScreenOnDuringNavigation = prefs[KEY_KEEP_SCREEN_ON] ?: true,
-                          performanceMode = prefs[KEY_PERF_MODE]?.let {
-                              runCatching { HardwarePerformanceMode.valueOf(it) }.getOrNull()
-                          } ?: HardwarePerformanceMode.BALANCED_ADAPTIVE,
-                          storageLocation = prefs[KEY_STORAGE_LOC]?.let {
-                              runCatching { StorageLocation.valueOf(it) }.getOrNull()
-                          } ?: StorageLocation.INTERNAL_UFS
+                          performanceMode = prefs[KEY_PERF_MODE]?.let { runCatching { HardwarePerformanceMode.valueOf(it) }.getOrNull() } ?: HardwarePerformanceMode.BALANCED_ADAPTIVE,
+                          storageLocation = prefs[KEY_STORAGE_LOC]?.let { runCatching { StorageLocation.valueOf(it) }.getOrNull() } ?: StorageLocation.INTERNAL_UFS
                       )
 
                       val updated = transform(current)
@@ -3090,7 +3013,7 @@ jobs:
           }
           ''')
 
-          write_file("app/src/main/java/ir/tehran/navigator/ui/viewmodel/TehranNavigationViewModel.kt", r'''
+          write_file(f"{pkg}/ui/viewmodel/TehranNavigationViewModel.kt", '''
           package ir.tehran.navigator.ui.viewmodel
 
           import android.app.Application
@@ -3119,11 +3042,7 @@ jobs:
 
           class TehranNavigationViewModel(application: Application) : AndroidViewModel(application) {
 
-              data class RoutePointSelection(
-                  val title: String,
-                  val lat: Double,
-                  val lon: Double
-              )
+              data class RoutePointSelection(val title: String, val lat: Double, val lon: Double)
 
               data class ActiveTurnByTurnState(
                   val isNavigating: Boolean = false,
@@ -3219,9 +3138,7 @@ jobs:
               private fun initializeOfflineEngines() {
                   viewModelScope.launch {
                       val extracted = storageManager.extractBundledAssetsIfNeeded { pct, msg ->
-                          _uiState.update {
-                              it.copy(loadingProgressPercent = pct, loadingStatusMessage = msg)
-                          }
+                          _uiState.update { it.copy(loadingProgressPercent = pct, loadingStatusMessage = msg) }
                       }
 
                       val pkgStatus = storageManager.checkPackageStatus(_uiState.value.settings.storageLocation)
@@ -3291,11 +3208,7 @@ jobs:
 
               fun onSearchQueryChanged(query: String) {
                   _uiState.update {
-                      it.copy(
-                          searchQuery = query,
-                          selectedPoiCategory = null,
-                          isSearchingAlongRoute = false
-                      )
+                      it.copy(searchQuery = query, selectedPoiCategory = null, isSearchingAlongRoute = false)
                   }
                   searchDebounceJob?.cancel()
 
@@ -3352,21 +3265,14 @@ jobs:
 
               fun clearSearchResults() {
                   _uiState.update {
-                      it.copy(
-                          searchQuery = "",
-                          selectedPoiCategory = null,
-                          isSearchingAlongRoute = false,
-                          searchResults = emptyList()
-                      )
+                      it.copy(searchQuery = "", selectedPoiCategory = null, isSearchingAlongRoute = false, searchResults = emptyList())
                   }
               }
 
               fun selectDestinationFromMapTap(lat: Double, lon: Double) {
                   viewModelScope.launch {
                       val resolvedAddress = placesRepository.reverseGeocodeOffline(lat, lon)
-                      setDestinationAndCalculateRoute(
-                          RoutePointSelection(title = resolvedAddress, lat = lat, lon = lon)
-                      )
+                      setDestinationAndCalculateRoute(RoutePointSelection(title = resolvedAddress, lat = lat, lon = lon))
                   }
               }
 
@@ -3386,21 +3292,12 @@ jobs:
                       lat = state.userLat,
                       lon = state.userLon
                   )
-
-                  _uiState.update {
-                      it.copy(
-                          originPoint = origin,
-                          destinationPoint = destination,
-                          routingErrorMessage = null
-                      )
-                  }
+                  _uiState.update { it.copy(originPoint = origin, destinationPoint = destination, routingErrorMessage = null) }
                   recalculateCurrentRoute()
               }
 
               fun addIntermediateWaypoint(waypoint: RoutePointSelection) {
-                  _uiState.update {
-                      it.copy(intermediateWaypoints = it.intermediateWaypoints + waypoint)
-                  }
+                  _uiState.update { it.copy(intermediateWaypoints = it.intermediateWaypoints + waypoint) }
                   recalculateCurrentRoute()
               }
 
@@ -3503,9 +3400,7 @@ jobs:
 
               fun stopNavigation() {
                   simulationJob?.cancel()
-                  _uiState.update {
-                      it.copy(navigationState = ActiveTurnByTurnState(isNavigating = false))
-                  }
+                  _uiState.update { it.copy(navigationState = ActiveTurnByTurnState(isNavigating = false)) }
               }
 
               private fun evaluateActiveNavigationProgress(
@@ -3657,9 +3552,7 @@ jobs:
               }
 
               fun updateUserPreferences(transform: (NavigatorUserSettings) -> NavigatorUserSettings) {
-                  viewModelScope.launch {
-                      preferencesStore.updateSettings(transform)
-                  }
+                  viewModelScope.launch { preferencesStore.updateSettings(transform) }
               }
 
               fun migrateStorageLocation(targetLocation: StorageLocation) {
@@ -3695,7 +3588,7 @@ jobs:
           }
           ''')
 
-          write_file("app/src/main/java/ir/tehran/navigator/MainActivity.kt", r'''
+          write_file(f"{pkg}/MainActivity.kt", '''
           package ir.tehran.navigator
 
           import android.Manifest
@@ -3790,6 +3683,7 @@ jobs:
           import androidx.compose.ui.unit.sp
           import androidx.core.content.ContextCompat
           import ir.tehran.navigator.data.audio.TehranPersianVoiceGuidanceEngine.VoiceGuidanceLevel
+          import ir.tehran.navigator.data.preferences.TehranNavigationPreferencesStore
           import ir.tehran.navigator.data.preferences.TehranNavigationPreferencesStore.AppThemePreference
           import ir.tehran.navigator.data.preferences.TehranNavigationPreferencesStore.HardwarePerformanceMode
           import ir.tehran.navigator.data.routing.TehranOfflineRoutingEngine.TransportMode
@@ -3822,9 +3716,7 @@ jobs:
                           } else {
                               window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
                           }
-                          onDispose {
-                              window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-                          }
+                          onDispose { window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) }
                       }
 
                       val colorScheme = if (isNightMode) {
@@ -3847,10 +3739,7 @@ jobs:
 
                       CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
                           MaterialTheme(colorScheme = colorScheme) {
-                              TehranOfflineNavigatorScreen(
-                                  viewModel = viewModel,
-                                  isNightMode = isNightMode
-                              )
+                              TehranOfflineNavigatorScreen(viewModel = viewModel, isNightMode = isNightMode)
                           }
                       }
                   }
@@ -3870,8 +3759,7 @@ jobs:
               val permissionLauncher = rememberLauncherForActivityResult(
                   contract = ActivityResultContracts.RequestMultiplePermissions()
               ) { permissions ->
-                  val fineGranted = permissions[Manifest.permission.ACCESS_FINE_LOCATION] == true
-                  if (fineGranted) {
+                  if (permissions[Manifest.permission.ACCESS_FINE_LOCATION] == true) {
                       viewModel.onLocationPermissionGranted()
                   }
               }
@@ -3957,9 +3845,7 @@ jobs:
                           contentAlignment = Alignment.Center
                       ) {
                           Card(
-                              modifier = Modifier
-                                  .fillMaxWidth()
-                                  .padding(24.dp),
+                              modifier = Modifier.fillMaxWidth().padding(24.dp),
                               shape = RoundedCornerShape(24.dp)
                           ) {
                               Column(
@@ -3968,15 +3854,8 @@ jobs:
                                   verticalArrangement = Arrangement.spacedBy(16.dp)
                               ) {
                                   CircularProgressIndicator()
-                                  Text(
-                                      text = "مسیریاب ۱۰۰٪ آفلاین تهران",
-                                      style = MaterialTheme.typography.titleMedium,
-                                      fontWeight = FontWeight.Bold
-                                  )
-                                  Text(
-                                      text = uiState.loadingStatusMessage,
-                                      style = MaterialTheme.typography.bodyMedium
-                                  )
+                                  Text("مسیریاب ۱۰۰٪ آفلاین تهران", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                                  Text(uiState.loadingStatusMessage, style = MaterialTheme.typography.bodyMedium)
                                   LinearProgressIndicator(
                                       progress = { uiState.loadingProgressPercent / 100f },
                                       modifier = Modifier.fillMaxWidth()
@@ -3999,9 +3878,7 @@ jobs:
                           ActiveTurnByTurnBanner(
                               navState = uiState.navigationState,
                               speedKmh = uiState.userSpeedKmh,
-                              onSearchFuelAlongRoute = {
-                                  viewModel.searchByQuickCategory("fuel", alongActiveRoute = true)
-                              }
+                              onSearchFuelAlongRoute = { viewModel.searchByQuickCategory("fuel", alongActiveRoute = true) }
                           )
                       } else {
                           SearchAndTrafficHeaderCard(
@@ -4018,9 +3895,7 @@ jobs:
 
                       if (uiState.searchResults.isNotEmpty()) {
                           Card(
-                              modifier = Modifier
-                                  .fillMaxWidth()
-                                  .heightIn(max = 310.dp),
+                              modifier = Modifier.fillMaxWidth().heightIn(max = 310.dp),
                               shape = RoundedCornerShape(20.dp),
                               elevation = CardDefaults.cardElevation(8.dp)
                           ) {
@@ -4035,12 +3910,7 @@ jobs:
                                           horizontalArrangement = Arrangement.SpaceBetween
                                       ) {
                                           Column(modifier = Modifier.weight(1f)) {
-                                              Text(
-                                                  text = place.name,
-                                                  fontWeight = FontWeight.Bold,
-                                                  maxLines = 1,
-                                                  overflow = TextOverflow.Ellipsis
-                                              )
+                                              Text(place.name, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
                                               Text(
                                                   text = "${place.categoryFa} • ${place.addressHint}",
                                                   style = MaterialTheme.typography.bodySmall,
@@ -4055,12 +3925,7 @@ jobs:
                                               } else {
                                                   "${dist.toInt()} متر"
                                               }
-                                              Text(
-                                                  text = distLabel,
-                                                  style = MaterialTheme.typography.labelMedium,
-                                                  color = MaterialTheme.colorScheme.primary,
-                                                  fontWeight = FontWeight.Bold
-                                              )
+                                              Text(distLabel, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
                                           }
                                       }
                                       HorizontalDivider(thickness = 0.5.dp)
@@ -4073,10 +3938,7 @@ jobs:
                   IconButton(
                       onClick = {
                           mapLibreRef?.animateCamera(
-                              CameraUpdateFactory.newLatLngZoom(
-                                  LatLng(uiState.userLat, uiState.userLon),
-                                  15.0
-                              ),
+                              CameraUpdateFactory.newLatLngZoom(LatLng(uiState.userLat, uiState.userLon), 15.0),
                               500
                           )
                       },
@@ -4086,26 +3948,17 @@ jobs:
                           .size(48.dp)
                           .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.92f), CircleShape)
                   ) {
-                      Icon(
-                          imageVector = Icons.Rounded.MyLocation,
-                          contentDescription = "موقعیت من",
-                          tint = MaterialTheme.colorScheme.primary
-                      )
+                      Icon(Icons.Rounded.MyLocation, contentDescription = "موقعیت من", tint = MaterialTheme.colorScheme.primary)
                   }
 
                   Column(
-                      modifier = Modifier
-                          .align(Alignment.BottomCenter)
-                          .fillMaxWidth()
-                          .padding(12.dp),
+                      modifier = Modifier.align(Alignment.BottomCenter).fillMaxWidth().padding(12.dp),
                       verticalArrangement = Arrangement.spacedBy(8.dp)
                   ) {
                       if (uiState.showSafetyDisclaimerBanner && !uiState.navigationState.isNavigating) {
                           Card(
                               shape = RoundedCornerShape(16.dp),
-                              colors = CardDefaults.cardColors(
-                                  containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.94f)
-                              )
+                              colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.94f))
                           ) {
                               Row(
                                   modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
@@ -4124,16 +3977,11 @@ jobs:
                       }
 
                       if (uiState.navigationState.isNavigating) {
-                          ActiveNavigationBottomBar(
-                              navState = uiState.navigationState,
-                              onStopNavigation = viewModel::stopNavigation
-                          )
+                          ActiveNavigationBottomBar(navState = uiState.navigationState, onStopNavigation = viewModel::stopNavigation)
                       } else if (uiState.calculatedRoutes.isNotEmpty()) {
                           RoutePreviewBottomCard(
                               uiState = uiState,
-                              onModeSelected = { mode ->
-                                  viewModel.updateUserPreferences { it.copy(transportMode = mode) }
-                              },
+                              onModeSelected = { mode -> viewModel.updateUserPreferences { it.copy(transportMode = mode) } },
                               onRouteSelected = viewModel::selectAlternativeRoute,
                               onStartRealNavigation = { viewModel.startNavigation(simulationMode = false) },
                               onStartSimulation = { viewModel.startNavigation(simulationMode = true, speedMultiplier = 3) },
@@ -4150,27 +3998,16 @@ jobs:
                                   horizontalArrangement = Arrangement.SpaceBetween,
                                   verticalAlignment = Alignment.CenterVertically
                               ) {
-                                  Text(
-                                      text = "برای انتخاب مقصد جستجو کنید یا روی نقشه لمس طولانی نمایید",
-                                      style = MaterialTheme.typography.bodySmall,
-                                      modifier = Modifier.weight(1f)
-                                  )
+                                  Text("برای انتخاب مقصد جستجو کنید یا روی نقشه لمس طولانی نمایید", style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(1f))
                                   Spacer(modifier = Modifier.width(8.dp))
-                                  Text(
-                                      text = "${uiState.activeSatellitesCount} ماهواره",
-                                      style = MaterialTheme.typography.labelSmall,
-                                      color = MaterialTheme.colorScheme.primary,
-                                      fontWeight = FontWeight.Bold
-                                  )
+                                  Text("${uiState.activeSatellitesCount} ماهواره", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
                               }
                           }
                       }
                   }
 
                   if (uiState.isSettingsSheetOpen) {
-                      ModalBottomSheet(
-                          onDismissRequest = { viewModel.toggleSettingsSheet(false) }
-                      ) {
+                      ModalBottomSheet(onDismissRequest = { viewModel.toggleSettingsSheet(false) }) {
                           ComprehensiveSettingsSheetContent(
                               uiState = uiState,
                               onUpdateSettings = viewModel::updateUserPreferences,
@@ -4193,9 +4030,7 @@ jobs:
           ) {
               Card(
                   shape = RoundedCornerShape(22.dp),
-                  colors = CardDefaults.cardColors(
-                      containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.96f)
-                  ),
+                  colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.96f)),
                   elevation = CardDefaults.cardElevation(6.dp)
               ) {
                   Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -4204,13 +4039,11 @@ jobs:
                               value = searchQuery,
                               onValueChange = onQueryChange,
                               modifier = Modifier.weight(1f),
-                              placeholder = { Text("جستجوی آفلاین خیابان، بزرگراه، محله، مترو، پمپ بنزین...", fontSize = 13.sp) },
+                              placeholder = { Text("جستجوی آفلاین محله، خیابان، مترو، پمپ بنزین...", fontSize = 13.sp) },
                               leadingIcon = { Icon(Icons.Rounded.Search, contentDescription = null) },
                               trailingIcon = {
                                   if (searchQuery.isNotEmpty()) {
-                                      IconButton(onClick = onClearSearch) {
-                                          Icon(Icons.Rounded.Close, contentDescription = "پاک کردن")
-                                      }
+                                      IconButton(onClick = onClearSearch) { Icon(Icons.Rounded.Close, contentDescription = "پاک کردن") }
                                   }
                               },
                               singleLine = true,
@@ -4219,15 +4052,9 @@ jobs:
                           Spacer(modifier = Modifier.width(8.dp))
                           IconButton(
                               onClick = onOpenSettingsClick,
-                              modifier = Modifier
-                                  .size(48.dp)
-                                  .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.14f), RoundedCornerShape(14.dp))
+                              modifier = Modifier.size(48.dp).background(MaterialTheme.colorScheme.primary.copy(alpha = 0.14f), RoundedCornerShape(14.dp))
                           ) {
-                              Icon(
-                                  imageVector = Icons.Rounded.Settings,
-                                  contentDescription = "تنظیمات",
-                                  tint = MaterialTheme.colorScheme.primary
-                              )
+                              Icon(Icons.Rounded.Settings, contentDescription = "تنظیمات", tint = MaterialTheme.colorScheme.primary)
                           }
                       }
 
@@ -4239,35 +4066,13 @@ jobs:
                       )
 
                       Row(
-                          modifier = Modifier
-                              .fillMaxWidth()
-                              .horizontalScroll(rememberScrollState()),
+                          modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
                           horizontalArrangement = Arrangement.spacedBy(6.dp)
                       ) {
-                          FilterChip(
-                              selected = false,
-                              onClick = { onQuickCategoryClick("fuel") },
-                              label = { Text("پمپ بنزین", fontSize = 12.sp) },
-                              leadingIcon = { Icon(Icons.Rounded.LocalGasStation, null, modifier = Modifier.size(16.dp)) }
-                          )
-                          FilterChip(
-                              selected = false,
-                              onClick = { onQuickCategoryClick("metro") },
-                              label = { Text("ایستگاه مترو", fontSize = 12.sp) },
-                              leadingIcon = { Icon(Icons.Rounded.Subway, null, modifier = Modifier.size(16.dp)) }
-                          )
-                          FilterChip(
-                              selected = false,
-                              onClick = { onQuickCategoryClick("hospital") },
-                              label = { Text("بیمارستان", fontSize = 12.sp) },
-                              leadingIcon = { Icon(Icons.Rounded.LocalHospital, null, modifier = Modifier.size(16.dp)) }
-                          )
-                          FilterChip(
-                              selected = false,
-                              onClick = { onQuickCategoryClick("pharmacy") },
-                              label = { Text("داروخانه", fontSize = 12.sp) },
-                              leadingIcon = { Icon(Icons.Rounded.LocalPharmacy, null, modifier = Modifier.size(16.dp)) }
-                          )
+                          FilterChip(selected = false, onClick = { onQuickCategoryClick("fuel") }, label = { Text("پمپ بنزین", fontSize = 12.sp) }, leadingIcon = { Icon(Icons.Rounded.LocalGasStation, null, modifier = Modifier.size(16.dp)) })
+                          FilterChip(selected = false, onClick = { onQuickCategoryClick("metro") }, label = { Text("ایستگاه مترو", fontSize = 12.sp) }, leadingIcon = { Icon(Icons.Rounded.Subway, null, modifier = Modifier.size(16.dp)) })
+                          FilterChip(selected = false, onClick = { onQuickCategoryClick("hospital") }, label = { Text("بیمارستان", fontSize = 12.sp) }, leadingIcon = { Icon(Icons.Rounded.LocalHospital, null, modifier = Modifier.size(16.dp)) })
+                          FilterChip(selected = false, onClick = { onQuickCategoryClick("pharmacy") }, label = { Text("داروخانه", fontSize = 12.sp) }, leadingIcon = { Icon(Icons.Rounded.LocalPharmacy, null, modifier = Modifier.size(16.dp)) })
                       }
                   }
               }
@@ -4293,60 +4098,29 @@ jobs:
                               else -> Icons.Rounded.Navigation
                           }
                           Box(
-                              modifier = Modifier
-                                  .size(52.dp)
-                                  .background(Color(0xFF047857), RoundedCornerShape(14.dp)),
+                              modifier = Modifier.size(52.dp).background(Color(0xFF047857), RoundedCornerShape(14.dp)),
                               contentAlignment = Alignment.Center
                           ) {
                               Icon(turnIcon, contentDescription = null, tint = Color.White, modifier = Modifier.size(32.dp))
                           }
                           Spacer(modifier = Modifier.width(12.dp))
                           Column(modifier = Modifier.weight(1f)) {
-                              Text(
-                                  text = "${navState.distanceToNextTurnMeters.toInt()} متر دیگر",
-                                  color = Color(0xFFA7F3D0),
-                                  fontWeight = FontWeight.Bold,
-                                  fontSize = 14.sp
-                              )
-                              Text(
-                                  text = navState.currentInstructionFa,
-                                  color = Color.White,
-                                  fontWeight = FontWeight.Black,
-                                  fontSize = 16.sp,
-                                  maxLines = 2
-                              )
-                              Text(
-                                  text = navState.currentStreetName,
-                                  color = Color(0xFFD1FAE5),
-                                  fontSize = 12.sp
-                              )
+                              Text("${navState.distanceToNextTurnMeters.toInt()} متر دیگر", color = Color(0xFFA7F3D0), fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                              Text(navState.currentInstructionFa, color = Color.White, fontWeight = FontWeight.Black, fontSize = 16.sp, maxLines = 2)
+                              Text(navState.currentStreetName, color = Color(0xFFD1FAE5), fontSize = 12.sp)
                           }
                           Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                              Text(
-                                  text = "${speedKmh.toInt()}",
-                                  color = Color.White,
-                                  fontWeight = FontWeight.Black,
-                                  fontSize = 20.sp
-                              )
-                              Text(text = "km/h", color = Color(0xFFA7F3D0), fontSize = 10.sp)
+                              Text("${speedKmh.toInt()}", color = Color.White, fontWeight = FontWeight.Black, fontSize = 20.sp)
+                              Text("km/h", color = Color(0xFFA7F3D0), fontSize = 10.sp)
                           }
                       }
 
                       if (navState.isTunnelDeadReckoning) {
-                          Text(
-                              text = "حالت ناوبری هوشمند داخل تونل فعال است",
-                              color = Color(0xFFFDE047),
-                              fontSize = 11.sp,
-                              fontWeight = FontWeight.Bold
-                          )
+                          Text("حالت ناوبری هوشمند داخل تونل فعال است", color = Color(0xFFFDE047), fontSize = 11.sp, fontWeight = FontWeight.Bold)
                       }
 
                       Row(horizontalArrangement = Arrangement.End, modifier = Modifier.fillMaxWidth()) {
-                          OutlinedButton(
-                              onClick = onSearchFuelAlongRoute,
-                              contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
-                              modifier = Modifier.height(30.dp)
-                          ) {
+                          OutlinedButton(onClick = onSearchFuelAlongRoute, contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp), modifier = Modifier.height(30.dp)) {
                               Text("جستجوی پمپ بنزین در مسیر", color = Color.White, fontSize = 11.sp)
                           }
                       }
@@ -4363,31 +4137,15 @@ jobs:
               onStartSimulation: () -> Unit,
               onClearRoute: () -> Unit
           ) {
-              val activeRoute = uiState.calculatedRoutes.getOrNull(uiState.selectedRouteIndex) ?: return
-
               Card(
                   shape = RoundedCornerShape(24.dp),
-                  colors = CardDefaults.cardColors(
-                      containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.97f)
-                  ),
+                  colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.97f)),
                   elevation = CardDefaults.cardElevation(10.dp)
               ) {
                   Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                      Row(
-                          verticalAlignment = Alignment.CenterVertically,
-                          horizontalArrangement = Arrangement.SpaceBetween,
-                          modifier = Modifier.fillMaxWidth()
-                      ) {
-                          Text(
-                              text = "مقصد: ${uiState.destinationPoint?.title ?: ""}",
-                              fontWeight = FontWeight.Bold,
-                              maxLines = 1,
-                              overflow = TextOverflow.Ellipsis,
-                              modifier = Modifier.weight(1f)
-                          )
-                          IconButton(onClick = onClearRoute, modifier = Modifier.size(28.dp)) {
-                              Icon(Icons.Rounded.Close, contentDescription = "لغو مسیر")
-                          }
+                      Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
+                          Text("مقصد: ${uiState.destinationPoint?.title ?: ""}", fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                          IconButton(onClick = onClearRoute, modifier = Modifier.size(28.dp)) { Icon(Icons.Rounded.Close, contentDescription = "لغو مسیر") }
                       }
 
                       Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
@@ -4397,9 +4155,8 @@ jobs:
                               Triple(TransportMode.PEDESTRIAN, "پیاده", Icons.Rounded.DirectionsWalk)
                           )
                           modes.forEach { (mode, title, icon) ->
-                              val selected = uiState.settings.transportMode == mode
                               FilterChip(
-                                  selected = selected,
+                                  selected = uiState.settings.transportMode == mode,
                                   onClick = { onModeSelected(mode) },
                                   label = { Text(title, fontSize = 12.sp) },
                                   leadingIcon = { Icon(icon, null, modifier = Modifier.size(16.dp)) },
@@ -4408,59 +4165,35 @@ jobs:
                           }
                       }
 
-                      Row(
-                          modifier = Modifier
-                              .fillMaxWidth()
-                              .horizontalScroll(rememberScrollState()),
-                          horizontalArrangement = Arrangement.spacedBy(8.dp)
-                      ) {
+                      Row(modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                           uiState.calculatedRoutes.forEachIndexed { idx, route ->
                               val isSelected = idx == uiState.selectedRouteIndex
                               val mins = (route.durationMillis / 60000L).coerceAtLeast(1)
                               val km = route.distanceMeters / 1000.0
                               Card(
                                   onClick = { onRouteSelected(idx) },
-                                  colors = CardDefaults.cardColors(
-                                      containerColor = if (isSelected) {
-                                          MaterialTheme.colorScheme.primary.copy(alpha = 0.2f)
-                                      } else {
-                                          MaterialTheme.colorScheme.surface
-                                      }
-                                  ),
+                                  colors = CardDefaults.cardColors(containerColor = if (isSelected) MaterialTheme.colorScheme.primary.copy(alpha = 0.2f) else MaterialTheme.colorScheme.surface),
                                   shape = RoundedCornerShape(14.dp)
                               ) {
                                   Column(modifier = Modifier.padding(10.dp)) {
                                       Text(route.labelFa, fontSize = 11.sp, fontWeight = FontWeight.Bold)
-                                      Text(
-                                          text = String.format(Locale("fa"), "%d دقیقه (%.1f ک.م)", mins, km),
-                                          fontSize = 13.sp,
-                                          fontWeight = FontWeight.Black,
-                                          color = MaterialTheme.colorScheme.primary
-                                      )
+                                      Text(String.format(Locale("fa"), "%d دقیقه (%.1f ک.م)", mins, km), fontSize = 13.sp, fontWeight = FontWeight.Black, color = MaterialTheme.colorScheme.primary)
                                   }
                               }
                           }
                       }
 
-                      activeRoute.crossesTrafficZoneWarning?.let { warning ->
-                          Text(text = warning, color = Color(0xFFF59E0B), fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                      uiState.calculatedRoutes.getOrNull(uiState.selectedRouteIndex)?.crossesTrafficZoneWarning?.let { warning ->
+                          Text(warning, color = Color(0xFFF59E0B), fontSize = 11.sp, fontWeight = FontWeight.Bold)
                       }
 
                       Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-                          Button(
-                              onClick = onStartRealNavigation,
-                              modifier = Modifier.weight(1.4f),
-                              shape = RoundedCornerShape(14.dp)
-                          ) {
+                          Button(onClick = onStartRealNavigation, modifier = Modifier.weight(1.4f), shape = RoundedCornerShape(14.dp)) {
                               Icon(Icons.Rounded.Navigation, contentDescription = null)
                               Spacer(modifier = Modifier.width(6.dp))
                               Text("شروع مسیریابی", fontWeight = FontWeight.Bold)
                           }
-                          OutlinedButton(
-                              onClick = onStartSimulation,
-                              modifier = Modifier.weight(1f),
-                              shape = RoundedCornerShape(14.dp)
-                          ) {
+                          OutlinedButton(onClick = onStartSimulation, modifier = Modifier.weight(1f), shape = RoundedCornerShape(14.dp)) {
                               Icon(Icons.Rounded.PlayArrow, contentDescription = null)
                               Spacer(modifier = Modifier.width(4.dp))
                               Text("شبیه‌ساز 3x", fontSize = 12.sp)
@@ -4477,35 +4210,13 @@ jobs:
           ) {
               val remMins = (navState.remainingDurationMillis / 60000L).coerceAtLeast(1)
               val remKm = navState.remainingDistanceMeters / 1000.0
-
-              Card(
-                  shape = RoundedCornerShape(22.dp),
-                  colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
-              ) {
-                  Row(
-                      modifier = Modifier
-                          .fillMaxWidth()
-                          .padding(horizontal = 16.dp, vertical = 12.dp),
-                      verticalAlignment = Alignment.CenterVertically,
-                      horizontalArrangement = Arrangement.SpaceBetween
-                  ) {
+              Card(shape = RoundedCornerShape(22.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
+                  Row(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
                       Column {
-                          Text(
-                              text = String.format(Locale("fa"), "%d دقیقه تا مقصد", remMins),
-                              fontWeight = FontWeight.Black,
-                              fontSize = 17.sp,
-                              color = MaterialTheme.colorScheme.primary
-                          )
-                          Text(
-                              text = String.format(Locale("fa"), "مسافت باقی‌مانده: %.1f کیلومتر", remKm),
-                              style = MaterialTheme.typography.bodySmall
-                          )
+                          Text(String.format(Locale("fa"), "%d دقیقه تا مقصد", remMins), fontWeight = FontWeight.Black, fontSize = 17.sp, color = MaterialTheme.colorScheme.primary)
+                          Text(String.format(Locale("fa"), "مسافت باقی‌مانده: %.1f کیلومتر", remKm), style = MaterialTheme.typography.bodySmall)
                       }
-                      Button(
-                          onClick = onStopNavigation,
-                          colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFDC2626)),
-                          shape = RoundedCornerShape(14.dp)
-                      ) {
+                      Button(onClick = onStopNavigation, colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFDC2626)), shape = RoundedCornerShape(14.dp)) {
                           Text("پایان حرکت", color = Color.White, fontWeight = FontWeight.Bold)
                       }
                   }
@@ -4515,218 +4226,94 @@ jobs:
           @Composable
           private fun ComprehensiveSettingsSheetContent(
               uiState: TehranNavigationViewModel.TehranNavigatorUiState,
-              onUpdateSettings: ((NavigatorUserSettings) -> NavigatorUserSettings) -> Unit,
+              onUpdateSettings: ((TehranNavigationPreferencesStore.NavigatorUserSettings) -> TehranNavigationPreferencesStore.NavigatorUserSettings) -> Unit,
               onMigrateStorage: (StorageLocation) -> Unit
           ) {
               val settings = uiState.settings
-
               Column(
-                  modifier = Modifier
-                      .fillMaxWidth()
-                      .verticalScroll(rememberScrollState())
-                      .padding(horizontal = 20.dp, vertical = 8.dp),
+                  modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(horizontal = 20.dp, vertical = 8.dp),
                   verticalArrangement = Arrangement.spacedBy(14.dp)
               ) {
-                  Text(
-                      text = "تنظیمات جامع مسیریاب آفلاین تهران",
-                      style = MaterialTheme.typography.titleLarge,
-                      fontWeight = FontWeight.Black
-                  )
-
+                  Text("تنظیمات جامع مسیریاب آفلاین تهران", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Black)
                   Text("۱. قوانین طرح ترافیک و آلودگی هوای تهران", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
-                  SettingSwitchRow(
-                      title = "دارای مجوز طرح ترافیک اصلی",
-                      checked = settings.hasMainTrafficPermit,
-                      onCheckedChange = { v -> onUpdateSettings { it.copy(hasMainTrafficPermit = v) } }
-                  )
-                  SettingSwitchRow(
-                      title = "دارای مجوز / سهمیه کنترل آلودگی هوا",
-                      checked = settings.hasAirPollutionPermit,
-                      onCheckedChange = { v -> onUpdateSettings { it.copy(hasAirPollutionPermit = v) } }
-                  )
-                  SettingSwitchRow(
-                      title = "نمایش محدوده طرح روی نقشه",
-                      checked = settings.showTrafficZonesOverlay,
-                      onCheckedChange = { v -> onUpdateSettings { it.copy(showTrafficZonesOverlay = v) } }
-                  )
+                  SettingSwitchRow("دارای مجوز طرح ترافیک اصلی", settings.hasMainTrafficPermit) { v -> onUpdateSettings { it.copy(hasMainTrafficPermit = v) } }
+                  SettingSwitchRow("دارای مجوز / سهمیه کنترل آلودگی هوا", settings.hasAirPollutionPermit) { v -> onUpdateSettings { it.copy(hasAirPollutionPermit = v) } }
+                  SettingSwitchRow("نمایش محدوده طرح روی نقشه", settings.showTrafficZonesOverlay) { v -> onUpdateSettings { it.copy(showTrafficZonesOverlay = v) } }
 
                   HorizontalDivider()
-
                   Text("۲. راهنمای صوتی فارسی (TTS)", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
                   VoiceGuidanceLevel.entries.forEach { level ->
-                      FilterChip(
-                          selected = settings.voiceGuidanceLevel == level,
-                          onClick = { onUpdateSettings { it.copy(voiceGuidanceLevel = level) } },
-                          label = { Text(level.titleFa) },
-                          modifier = Modifier.fillMaxWidth()
-                      )
+                      FilterChip(selected = settings.voiceGuidanceLevel == level, onClick = { onUpdateSettings { it.copy(voiceGuidanceLevel = level) } }, label = { Text(level.titleFa) }, modifier = Modifier.fillMaxWidth())
                   }
 
                   HorizontalDivider()
-
                   Text("۳. نمایشگر Super AMOLED و سخت‌افزار Galaxy A54", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
                   AppThemePreference.entries.forEach { themePref ->
-                      FilterChip(
-                          selected = settings.themePreference == themePref,
-                          onClick = { onUpdateSettings { it.copy(themePreference = themePref) } },
-                          label = { Text(themePref.titleFa) },
-                          modifier = Modifier.fillMaxWidth()
-                      )
+                      FilterChip(selected = settings.themePreference == themePref, onClick = { onUpdateSettings { it.copy(themePreference = themePref) } }, label = { Text(themePref.titleFa) }, modifier = Modifier.fillMaxWidth())
                   }
-                  SettingSwitchRow(
-                      title = "نمایش سه‌بعدی ساختمان‌های تهران (3D Extrusion)",
-                      checked = settings.is3DBuildingsEnabled,
-                      onCheckedChange = { v -> onUpdateSettings { it.copy(is3DBuildingsEnabled = v) } }
-                  )
+                  SettingSwitchRow("نمایش سه‌بعدی ساختمان‌های تهران (3D Extrusion)", settings.is3DBuildingsEnabled) { v -> onUpdateSettings { it.copy(is3DBuildingsEnabled = v) } }
 
-                  Text("حالت عملکرد پردازنده Exynos 1380 و نرخ نوسازی:", fontSize = 13.sp)
                   HardwarePerformanceMode.entries.forEach { perf ->
-                      FilterChip(
-                          selected = settings.performanceMode == perf,
-                          onClick = { onUpdateSettings { it.copy(performanceMode = perf) } },
-                          label = { Text(perf.titleFa) },
-                          modifier = Modifier.fillMaxWidth()
-                      )
+                      FilterChip(selected = settings.performanceMode == perf, onClick = { onUpdateSettings { it.copy(performanceMode = perf) } }, label = { Text(perf.titleFa) }, modifier = Modifier.fillMaxWidth())
                   }
 
                   Text("حساسیت بازمحاسبه خودکار مسیر: ${settings.rerouteThresholdMeters.toInt()} متر", fontSize = 13.sp)
-                  Slider(
-                      value = settings.rerouteThresholdMeters,
-                      onValueChange = { v -> onUpdateSettings { it.copy(rerouteThresholdMeters = v) } },
-                      valueRange = 25f..100f
-                  )
+                  Slider(value = settings.rerouteThresholdMeters, onValueChange = { v -> onUpdateSettings { it.copy(rerouteThresholdMeters = v) } }, valueRange = 25f..100f)
 
                   HorizontalDivider()
-
                   Text("۴. محل ذخیره‌سازی پکیج آفلاین تهران", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
                   uiState.packageStatus?.let { pkg ->
-                      Text(
-                          text = String.format(
-                              Locale("fa"),
-                              "حجم دیتای نصب‌شده: %.1f مگابایت | فضای آزاد: %d مگابایت",
-                              pkg.totalSizeMb,
-                              pkg.availableSpaceMb
-                          ),
-                          style = MaterialTheme.typography.bodySmall
-                      )
+                      Text(String.format(Locale("fa"), "حجم دیتای نصب‌شده: %.1f مگابایت | فضای آزاد: %d مگابایت", pkg.totalSizeMb, pkg.availableSpaceMb), style = MaterialTheme.typography.bodySmall)
                   }
                   Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-                      FilterChip(
-                          selected = settings.storageLocation == StorageLocation.INTERNAL_UFS,
-                          onClick = { onMigrateStorage(StorageLocation.INTERNAL_UFS) },
-                          label = { Text("حافظه داخلی UFS") },
-                          modifier = Modifier.weight(1f)
-                      )
-                      FilterChip(
-                          selected = settings.storageLocation == StorageLocation.EXTERNAL_SD,
-                          onClick = { onMigrateStorage(StorageLocation.EXTERNAL_SD) },
-                          label = { Text("کارت MicroSD") },
-                          modifier = Modifier.weight(1f)
-                      )
+                      FilterChip(selected = settings.storageLocation == StorageLocation.INTERNAL_UFS, onClick = { onMigrateStorage(StorageLocation.INTERNAL_UFS) }, label = { Text("حافظه داخلی UFS") }, modifier = Modifier.weight(1f))
+                      FilterChip(selected = settings.storageLocation == StorageLocation.EXTERNAL_SD, onClick = { onMigrateStorage(StorageLocation.EXTERNAL_SD) }, label = { Text("کارت MicroSD") }, modifier = Modifier.weight(1f))
                   }
-
                   Spacer(modifier = Modifier.height(24.dp))
               }
           }
 
           @Composable
-          private fun SettingSwitchRow(
-              title: String,
-              checked: Boolean,
-              onCheckedChange: (Boolean) -> Unit
-          ) {
-              Row(
-                  modifier = Modifier.fillMaxWidth(),
-                  verticalAlignment = Alignment.CenterVertically,
-                  horizontalArrangement = Arrangement.SpaceBetween
-              ) {
-                  Text(text = title, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
+          private fun SettingSwitchRow(title: String, checked: Boolean, onCheckedChange: (Boolean) -> Unit) {
+              Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
+                  Text(title, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
                   Switch(checked = checked, onCheckedChange = onCheckedChange)
               }
           }
           ''')
 
-          print("ALL 26 PROJECT SOURCE & CONFIG FILES GENERATED SUCCESSFULLY!")
-          PYBOOTSTRAP
+          # 6. Copy Tehran Offline Data into Android Assets
+          os.makedirs("app/src/main/assets/map", exist_ok=True)
+          os.makedirs("app/src/main/assets/database", exist_ok=True)
+          os.makedirs("app/src/main/assets/routing", exist_ok=True)
 
-      - name: ۳. استخراج پاک‌سازی‌شده نقشه کلانشهر تهران از OpenStreetMap
+          shutil.copy("data_pipeline/tehran_vector.pmtiles", "app/src/main/assets/map/tehran_vector.pmtiles")
+          shutil.copy("data_pipeline/tehran_places_fts5.db", "app/src/main/assets/database/tehran_places_fts5.db")
+          shutil.copytree("data_pipeline/tehran_routing_graph", "app/src/main/assets/routing/tehran_routing_graph", dirs_exist_ok=True)
+          print("All offline Tehran assets successfully bundled into app/src/main/assets!")
+          EOF
+
+      - name: ۹. راه‌اندازی Gradle و تولید کلید امضای APK
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+
+      - name: ۱۰. کامپایل نهایی و ساخت فایل نصبی امضاشده برای Samsung Galaxy A54
         run: |
-          cd data_pipeline
-          wget -q https://download.geofabrik.de/asia/iran-latest.osm.pbf
-          osmium extract -b 51.05,35.50,51.68,35.86 iran-latest.osm.pbf -o tehran_raw.osm.pbf
-          osmium tags-filter tehran_raw.osm.pbf \
-            --remove-tags \
-            --invert-match \
-            nwr/landuse=military \
-            nwr/military \
-            n/highway=speed_camera \
-            n/enforcement \
-            -o tehran_clean.osm.pbf
-          rm -f iran-latest.osm.pbf tehran_raw.osm.pbf
+          keytool -genkeypair -v \
+            -keystore app/tehran_release.keystore \
+            -alias tehran_nav \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -storepass tehran_offline_key \
+            -keypass tehran_offline_key \
+            -dname "CN=TehranOfflineNavigator, OU=Mobile, O=Tehran, L=Tehran, C=IR"
+          gradle assembleRelease --no-daemon --stacktrace
+          ls -lh app/build/outputs/apk/release/
 
-      - name: ۴. تولید نقشه برداری فوق‌فشرده (tehran_vector.pmtiles)
-        run: |
-          cd data_pipeline
-          wget -q https://github.com/onthegomap/planetiler/releases/latest/download/planetiler.jar
-          java -Xmx6g -jar planetiler.jar \
-            --osm-path=tehran_clean.osm.pbf \
-            --output=tehran_vector.pmtiles \
-            --bounds=51.05,35.50,51.68,35.86 \
-            --languages=fa,en \
-            --download
-
-      - name: ۵. تولید گراف مسیریابی آفلاین GraphHopper 10.0 (CH + LM)
-        run: |
-          cd data_pipeline
-          wget -q https://repo1.maven.org/maven2/com/graphhopper/graphhopper-web/10.0/graphhopper-web-10.0.jar
-          java -Xmx6g -Ddw.graphhopper.datareader.file=tehran_clean.osm.pbf \
-            -jar graphhopper-web-10.0.jar import graphhopper_tehran_config.yml
-
-      - name: ۶. ساخت پایگاه‌داده جامع معابر و مکان‌های تهران (SQLite FTS5 + R*Tree) و تست جستجو
-        run: |
-          cd data_pipeline
-          python3 build_tehran_places_db.py \
-            --pbf tehran_clean.osm.pbf \
-            --out tehran_places_fts5.db
-          echo "=== تست خودکار جستجوی خیابان ولیعصر و بزرگراه همت در دیتابیس ==="
-          sqlite3 tehran_places_fts5.db "SELECT name, category_fa, lat, lon FROM places WHERE places_fts MATCH '\"ولیعصر\"*' LIMIT 5;"
-          sqlite3 tehran_places_fts5.db "SELECT name, category_fa, lat, lon FROM places WHERE places_fts MATCH '\"همت\"*' LIMIT 5;"
-
-      - name: ۷. تولید فونت برداری فارسی (Vazirmatn Glyphs) و آیکون‌ها
-        run: |
-          mkdir -p app/src/main/assets/map/glyphs
-          mkdir -p app/src/main/assets/map/sprites
-          wget -q https://github.com/rastikerdar/vazirmatn/raw/master/fonts/ttf/Vazirmatn-Regular.ttf
-          wget -q https://github.com/rastikerdar/vazirmatn/raw/master/fonts/ttf/Vazirmatn-Bold.ttf
-          npx --yes @maplibre/font-maker Vazirmatn-Regular.ttf Vazirmatn-Bold.ttf -o app/src/main/assets/map/glyphs/
-          echo '{}' > app/src/main/assets/map/sprites/sprite.json
-          echo '{}' > app/src/main/assets/map/sprites/sprite@2x.json
-          convert -size 16x16 xc:transparent app/src/main/assets/map/sprites/sprite.png
-          convert -size 32x32 xc:transparent app/src/main/assets/map/sprites/sprite@2x.png
-
-      - name: ۸. انتقال داده‌های تولیدشده تهران به پوشه assets پروژه اندروید
-        run: |
-          mkdir -p app/src/main/assets/map
-          mkdir -p app/src/main/assets/routing
-          mkdir -p app/src/main/assets/database
-
-          mv data_pipeline/tehran_vector.pmtiles app/src/main/assets/map/
-          mv data_pipeline/tehran_routing_graph app/src/main/assets/routing/
-          mv data_pipeline/tehran_places_fts5.db app/src/main/assets/database/
-          rm -rf data_pipeline
-
-      - name: ۹. راه‌اندازی Android SDK و کامپایل فایل نصبی APK ویژه Galaxy A54
-        uses: android-actions/setup-android@v3
-
-      - name: ساخت نهایی فایل APK آماده نصب روی گوشی
-        run: |
-          gradle wrapper --gradle-version 8.9
-          chmod +x gradlew
-          ./gradlew assembleDebug --no-daemon
-
-      - name: ۱۰. آپلود فایل نهایی APK برای دانلود مستقیم
+      - name: ۱۱. آپلود فایل نصبی آماده دانلود (Artifact)
         uses: actions/upload-artifact@v4
         with:
           name: TehranOfflineNavigator-GalaxyA54-APK
-          path: app/build/outputs/apk/debug/app-debug.apk
-          retention-days: 30
+          path: app/build/outputs/apk/release/*.apk
